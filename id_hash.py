@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
 # id_hash.py — Jython 2.7 compatible Burp extension
 # Update: reduce "real words" false positives, especially in STRICT mode.
-# - Adds _englishy() heuristic (alpha/space/vowel patterns) on decoded bytes.
-# - In STRICT mode:
-#     * base64/base64url decoded length must match common digest sizes
-#     * plain-hex must have some digit variety (>=10% digits)
-#     * if not exact digest length and not labelled, require nearby context keywords
-# - Strict remains OFF by default; use the tab to enable.
+# Base64 changes:
+# - Use Burp's IExtensionHelpers.base64Decode
+# - Gate decoded length to common digest sizes even when STRICT is OFF
+# - Tighten Base64URL regex to require '-' or '_' to avoid matching plain hex
+# Defaults in this build: STRICT OFF, Base64 OFF, Base64URL OFF.
 from burp import IBurpExtender, IHttpListener, ITab, IScanIssue, IScannerCheck
 from javax.swing import JPanel, JCheckBox, JLabel, JButton, BoxLayout, JScrollPane, JTextArea, JSpinner
 from javax.swing import SpinnerNumberModel
 from java.awt import Dimension
 import re
-import base64
 import json
 import zlib
 from java.io import ByteArrayInputStream, InputStreamReader, BufferedReader
@@ -26,8 +24,9 @@ except Exception:
 
 UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 LABELLED_RE = re.compile(r'(?i)\b(md5|sha1|sha224|sha256|sha384|sha512|sha3-224|sha3-256|sha3-384|sha3-512|blake2s|blake2b|ripemd160|whirlpool)\b\s*[:=]\s*([0-9A-Fa-f]{8,256})')
-B64_RE    = re.compile(r'(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{12,344}={0,2})(?![A-Za-z0-9+/=])')
-B64URL_RE = re.compile(r'(?<![A-Za-z0-9\-_])([A-Za-z0-9\-_]{12,344}={0,2})(?![A-Za-z0-9\-_])')
+B64_RE    = re.compile(r'(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{12,512}={0,2})(?![A-Za-z0-9+/=])')
+# Require at least one '-' or '_' so we do not collide with plain hex or standard base64
+B64URL_RE = re.compile(r'(?<![A-Za-z0-9\-_])(?=[A-Za-z0-9\-_]*[-_])[A-Za-z0-9\-_]{16,512}={0,2}(?![A-Za-z0-9\-_])')
 MCF_RE    = re.compile(r'(?x)(?<![A-Za-z0-9\$])(\$(?:1|2a|2b|2y|5|6)\$[^\s]{1,100}|\$(?:apr1)\$[^\s]{1,100}|\$(?:pbkdf2-sha1|pbkdf2-sha256)\$[^\s]{1,200}|\$(?:argon2id|argon2i|argon2d)\$[^\s]{1,300})(?![A-Za-z0-9\$])')
 
 BLOCKED_CT_RE = re.compile(r'(?i)^(image/|video/|audio/|font/|application/(?:pdf|octet-stream|x-protobuf|protobuf|wasm|zip|gzip|x-gzip|x-7z-compressed|x-rar-compressed|vnd\.)|text/(?:css|javascript)|application/(?:javascript|x-javascript)|text/javascript|text/css)')
@@ -85,18 +84,12 @@ def _looks_like_text(bs, printable_cutoff):
     return False
 
 def _englishy(bs):
-    """Return True if bs decodes to English-like text (words/spaces typical ratios)."""
     try:
         s = ''.join([chr(b) for b in bs])
     except Exception:
         return False
     if not s:
         return False
-    # basic ASCII only
-    try:
-        s.decode('ascii')
-    except Exception:
-        pass  # Jython bytes->str is already ascii-ish
     n = float(len(s))
     letters = sum([1 for ch in s if ('A' <= ch <= 'Z') or ('a' <= ch <= 'z')])
     spaces  = s.count(' ')
@@ -105,13 +98,11 @@ def _englishy(bs):
     space_ratio = spaces / n
     vowel_ratio = (float(vowels) / float(letters)) if letters else 0.0
     pr = _printable_ratio([ord(c) for c in s])
-    # English-like if: mostly printable, decent letters, some spaces, plausible vowel rate
     if pr >= 0.9 and (alpha_ratio >= 0.6) and (space_ratio >= 0.02) and (0.25 <= vowel_ratio <= 0.5):
         return True
     return False
 
 def _hex_digit_ratio(s):
-    """Proportion of digits 0-9 among hex chars; random digests typically mix. Very low ratios look word-like (a-f only)."""
     digits = 0
     total = 0
     for ch in s:
@@ -170,14 +161,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-        callbacks.setExtensionName("Hash Detector (reduced text FPs)")
+        callbacks.setExtensionName("Hash Detector (base64 gated, url strict)")
 
         # recall-friendly defaults
         self.min_hex_len = 16
         self.max_scan = 5000000
         self.require_context = False
-        self.enable_base64 = True
-        self.enable_b64url = True
+        self.enable_base64 = False   # disabled by default per request
+        self.enable_b64url = False   # disabled by default per request
         self.enable_mcf = True
         self.strict_mode = False
         self.strict_exact_hex_lengths = False
@@ -203,7 +194,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
         callbacks.registerHttpListener(self)
         callbacks.registerScannerCheck(self)
 
-        self._log("Loaded: strict OFF. Extra English-text filter active in STRICT.")
+        self._log("Loaded: strict OFF; Base64 OFF; Base64URL OFF. Using Burp base64Decode with digest-length gating.")
 
     def _init_ui(self):
         panel = JPanel()
@@ -221,8 +212,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
 
         panel.add(JLabel("Advanced:"))
         self.cb_context = JCheckBox("Require context keywords (global)", False, actionPerformed=lambda e: self._tog('require_context', self.cb_context))
-        self.cb_b64 = JCheckBox("Detect Base64", True, actionPerformed=lambda e: self._tog('enable_base64', self.cb_b64))
-        self.cb_b64url = JCheckBox("Detect Base64URL (-,_)", True, actionPerformed=lambda e: self._tog('enable_b64url', self.cb_b64url))
+        self.cb_b64 = JCheckBox("Detect Base64 (Burp)", False, actionPerformed=lambda e: self._tog('enable_base64', self.cb_b64))
+        self.cb_b64url = JCheckBox("Detect Base64URL (-,_)", False, actionPerformed=lambda e: self._tog('enable_b64url', self.cb_b64url))
         self.cb_mcf = JCheckBox("Detect MCF ($2y$, $6$, argon2id, ...)", True, actionPerformed=lambda e: self._tog('enable_mcf', self.cb_mcf))
         self.cb_strict = JCheckBox("Strict mode (entropy/length gating)", False, actionPerformed=lambda e: self._tog('strict_mode', self.cb_strict))
         self.cb_strict_exact = JCheckBox("Strict exact hex lengths", False, actionPerformed=lambda e: self._tog('strict_exact_hex_lengths', self.cb_strict_exact))
@@ -510,7 +501,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             issues.append(_Issue(messageInfo, url, "Hash/token (label:%s)" % label, "Firm",
                                  "Location: %s<br>Value: <b>%s</b><br>Label: %s" % (where, cand, label)))
 
-        # Plain hex (with optional local context gating in strict mode)
+        # Plain hex
         for mo in self.HEX_RE.finditer(text):
             try:
                 cand = mo.group(1) or mo.group(0)
@@ -520,19 +511,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
                 continue
             if self.strict_mode and self.strict_exact_hex_lengths and (len(cand) not in STRICT_HEX_LENGTHS):
                 continue
-            # hex digit balance in strict mode
-            if self.strict_mode:
-                if _hex_digit_ratio(cand) < 0.10:
-                    # looks like only a-f letters -> likely words/prose encoded as hex
+            if self.strict_mode and _hex_digit_ratio(cand) < 0.10:
+                continue
+            if self.strict_mode and (len(cand) not in STRICT_HEX_LENGTHS) and self.strict_local_context:
+                start = max(0, mo.start() - 50)
+                end = min(len(text), mo.end() + 50)
+                ctx = text[start:end].lower()
+                if not any(k in ctx for k in ("hash","sha","digest","md5","sha1","sha256","token","checksum","hmac")):
                     continue
-            # local context around match if strict and not exact length & not labelled
-            if self.strict_mode and (len(cand) not in STRICT_HEX_LENGTHS):
-                if self.strict_local_context:
-                    start = max(0, mo.start() - 50)
-                    end = min(len(text), mo.end() + 50)
-                    ctx = text[start:end].lower()
-                    if not any(k in ctx for k in ("hash","sha","digest","md5","sha1","sha256","token","checksum","hmac")):
-                        continue
             bs = _unhex(cand)
             if not _likely_digest_bytes(bs, self.strict_mode, self.entropy_threshold, self.printable_cutoff, self.strict_exact_hex_lengths):
                 continue
@@ -540,17 +526,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             issues.append(_Issue(messageInfo, url, "Hash/token (hex)", context_conf,
                                  "Location: %s<br>Value: <b>%s</b><br>Len: %d<br>Candidates: %s" % (where, cand, len(cand), ", ".join(algs))))
 
-        # Base64
+        # Base64 using Burp helpers (always gate by decoded length)
         if self.enable_base64:
             for mo in B64_RE.finditer(text):
                 b64 = mo.group(1)
                 try:
-                    bs = base64.b64decode(b64)
+                    jbytes = self._helpers.base64Decode(b64)
+                    bs = bytearray(jbytes) if jbytes is not None else None
                 except Exception:
                     continue
-                if self.strict_mode:
-                    if len(bs) not in LIKELY_DIGEST_BYTE_LENGTHS:
-                        continue
+                if not bs:
+                    continue
+                if len(bs) not in LIKELY_DIGEST_BYTE_LENGTHS:
+                    continue
                 if not _likely_digest_bytes(bs, self.strict_mode, self.entropy_threshold, self.printable_cutoff, self.strict_exact_hex_lengths):
                     continue
                 L = len(bs)
@@ -559,20 +547,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
                 issues.append(_Issue(messageInfo, url, "Hash/token (base64)", conf,
                                      "Location: %s<br>Value: <b>%s</b><br>Candidates: %s" % (where, b64, ", ".join(algs) if algs else "unknown")))
 
-        # Base64URL
+        # Base64URL using Burp helpers (regex requires '-' or '_'; gate by decoded length)
         if self.enable_b64url:
             for mo in B64URL_RE.finditer(text):
-                b64u = mo.group(1)
+                b64u = mo.group(0)  # entire match contains at least one '-' or '_'
                 norm = b64u.replace('-', '+').replace('_', '/')
                 pad = (4 - (len(norm) % 4)) % 4
                 norm += "=" * pad
                 try:
-                    bs = base64.b64decode(norm)
+                    jbytes = self._helpers.base64Decode(norm)
+                    bs = bytearray(jbytes) if jbytes is not None else None
                 except Exception:
                     continue
-                if self.strict_mode:
-                    if len(bs) not in LIKELY_DIGEST_BYTE_LENGTHS:
-                        continue
+                if not bs:
+                    continue
+                if len(bs) not in LIKELY_DIGEST_BYTE_LENGTHS:
+                    continue
                 if not _likely_digest_bytes(bs, self.strict_mode, self.entropy_threshold, self.printable_cutoff, self.strict_exact_hex_lengths):
                     continue
                 L = len(bs)
