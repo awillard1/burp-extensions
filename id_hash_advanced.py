@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
-# id_hash_with_io_custom_dir_dedupe_csv.py — Jython 2.7 compatible Burp extension
+# id_hash_with_io_custom_dir_dedupe_csv_ignorefonts_paramnamecsv.py — Jython 2.7 compatible Burp extension
 # Detects hashes in requests/responses and when found:
 #   - Appends the hash to <outputDir>/hashes.txt
-#   - Appends request parameter VALUES (URL + body + multipart) to <outputDir>/inputs.txt
-#   - (Optional, default ON) Also writes CSV with timestamps:
+#   - Appends request parameter VALUES (URL + body + multipart) to <outputDir>/inputs.txt   (values only)
+#   - (Optional, default ON) Also writes CSVs with timestamps:
 #         <outputDir>/hashes.csv   -> "timestamp,value"
-#         <outputDir>/inputs.csv   -> "timestamp,value"
+#         <outputDir>/inputs.csv   -> "timestamp,param_name,value"   (now includes param name)
 # Extras:
 #   - Configurable output directory (default: ~/burp-outputs) with persistence
 #   - Creates output directory if missing
-#   - De-duplication toggle (recent in-memory window) for both files
+#   - De-duplication toggle (recent in-memory window) for both files (inputs de-duped by (name,value))
 #   - Max/min input value length guards
 #   - Always captures URL params even for POST/PUT/PATCH
 #   - "Clear recent cache" button
+#   - Skips font/static assets by both Content-Type and path extension (.woff2/.woff/.ttf/.otf/.eot/.svg/.ico, plus .js/.css/.map)
 #
 # Notes:
 # - Cookies only scanned if Request Cookies/Headers toggled on.
@@ -60,11 +61,25 @@ UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 LABELLED_RE = re.compile(r'(?i)\b(md5|sha1|sha224|sha256|sha384|sha512|sha3-224|sha3-256|sha3-384|sha3-512|blake2s|blake2b|ripemd160|whirlpool)\b\s*[:=]\s*([0-9A-Fa-f]{8,256})')
 MCF_RE = re.compile(r'(?x)(?<![A-Za-z0-9\$])(\$(?:1|2a|2b|2y|5|6)\$[^\s]{1,100}|\$(?:apr1)\$[^\s]{1,100}|\$(?:pbkdf2-sha1|pbkdf2-sha256)\$[^\s]{1,200}|\$(?:argon2id|argon2i|argon2d)\$[^\s]{1,300})(?![A-Za-z0-9\$])')
 
-BLOCKED_CT_RE = re.compile(r'(?i)^(image/|video/|audio/|font/|application/(?:pdf|octet-stream|x-protobuf|protobuf|wasm|zip|gzip|x-gzip|x-7z-compressed|x-rar-compressed|vnd\.)|text/(?:css|javascript)|application/(?:javascript|x-javascript)|text/javascript|text/css)')
+# Block scanning for these content-types (includes common font mime types)
+BLOCKED_CT_RE = re.compile(
+    r'(?i)^(?:'
+    r'(?:image|video|audio|font)/|'                                  # e.g., font/woff2
+    r'text/(?:css|javascript)|'                                      # text/css, text/javascript
+    r'application/(?:'
+        r'pdf|octet-stream|x-protobuf|protobuf|wasm|zip|gzip|x-gzip|'
+        r'x-7z-compressed|x-rar-compressed|vnd\.|javascript|x-javascript|'
+        r'font-woff2?|x-font-ttf|x-font-otf|x-font-woff|font-ttf|font-otf'
+    r')'
+    r')'
+)
 
 PRINTABLE_CHARS = set([ord(c) for c in (
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,:;+-/_=!@#$%^&*()[]{}<>?\\|\"'`~\t\r\n"
 )])
+
+# Extensions to skip early by path
+IGNORED_EXTS = (".js", ".css", ".map", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".svg", ".ico")
 
 # ---------- helpers ----------
 def _byte_entropy(bs):
@@ -190,12 +205,12 @@ def _is_blocked_content_type(ct_value):
         return False
     return bool(BLOCKED_CT_RE.match(ct_value))
 
-def _is_js_path(url_path):
+def _is_ignored_path(url_path):
     try:
         if not url_path:
             return False
-        p = url_path.split("?",1)[0].lower()
-        return p.endswith(".js")
+        p = url_path.split("?", 1)[0].lower()
+        return any(p.endswith(ext) for ext in IGNORED_EXTS)
     except Exception:
         return False
 
@@ -301,7 +316,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
         self.cb_req_cookies = JCheckBox("Request Cookies", False, actionPerformed=lambda e: self._tog('scan_req_cookies', self.cb_req_cookies))
         self.cb_resp_headers = JCheckBox("Response Headers", False, actionPerformed=lambda e: self._tog('scan_resp_headers', self.cb_resp_headers))
         self.cb_resp_body = JCheckBox("Response Body", True, actionPerformed=lambda e: self._tog('scan_resp_body', self.cb_resp_body))
-        for cb in (self.cb_req_path,self.cb_req_query,self.cb_req_params,self.cb_req_body,self.cb_req_headers,self.cb_req_cookies,self.cb_resp_headers,self.cb_resp_body):
+        for cb in (self.cb_req_path,self.cb_req_query,self.cb_req_params,self.cb_req_body,self.cb_req_headers,self.cb_resp_headers,self.cb_resp_body):
             panel.add(cb)
 
         # Advanced
@@ -486,7 +501,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             pw = PrintWriter(bw)
             try:
                 if need_header:
-                    pw.println("timestamp,value")
+                    # Choose header based on which CSV we're writing
+                    if "inputs.csv" in file_obj.getName():
+                        pw.println("timestamp,param_name,value")
+                    else:
+                        pw.println("timestamp,value")
                 def q(s):
                     if s is None:
                         return ""
@@ -515,23 +534,23 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             return ""
 
     # ---------- De-dupe helpers ----------
-    def _recent_add(self, kind, val):
+    def _recent_add(self, kind, key):
         try:
             if kind == "hash":
-                if val in self._recent_hashes_set:
+                if key in self._recent_hashes_set:
                     return False
-                self._recent_hashes.append(val)
-                self._recent_hashes_set.add(val)
+                self._recent_hashes.append(key)
+                self._recent_hashes_set.add(key)
                 if len(self._recent_hashes) > self._dedupe_window:
                     old = self._recent_hashes.pop(0)
                     try: self._recent_hashes_set.remove(old)
                     except Exception: pass
                 return True
             else:
-                if val in self._recent_inputs_set:
+                if key in self._recent_inputs_set:
                     return False
-                self._recent_inputs.append(val)
-                self._recent_inputs_set.add(val)
+                self._recent_inputs.append(key)
+                self._recent_inputs_set.add(key)
                 if len(self._recent_inputs) > self._dedupe_window:
                     old = self._recent_inputs.pop(0)
                     try: self._recent_inputs_set.remove(old)
@@ -547,7 +566,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             return True
         return self._recent_add("hash", hashval)
 
-    def _should_write_input(self, val):
+    def _mk_input_key(self, name, val):
+        try:
+            n = "" if name is None else str(name)
+            v = "" if val is None else str(val)
+            return n + "=" + v
+        except Exception:
+            return str(name) + "=" + str(val)
+
+    def _should_write_input(self, name, val):
         if val is None:
             return False
         if self.max_value_len > 0 and len(val) > self.max_value_len:
@@ -556,7 +583,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             return False
         if not self.dedupe_enabled:
             return True
-        return self._recent_add("input", val)
+        return self._recent_add("input", self._mk_input_key(name, val))
 
     def _write_hash(self, hashval):
         if self._should_write_hash(hashval):
@@ -564,13 +591,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             if self.csv_enabled:
                 self._append_csv(self.hashes_csv, [self._now_ts(), hashval])
 
-    def _write_input_value(self, val):
-        if self._should_write_input(val):
+    def _write_input(self, name, val):
+        if self._should_write_input(name, val):
+            # .txt remains value-only per original requirement
             self._append_file(self.inputs_path, val)
             if self.csv_enabled:
-                self._append_csv(self.inputs_csv, [self._now_ts(), val])
+                self._append_csv(self.inputs_csv, [self._now_ts(), (name or ""), val])
 
-    # ---------- Collect request param VALUES (URL + body + multipart) ----------
+    # ---------- Collect request param (NAME, VALUE) pairs (URL + body + multipart) ----------
     def _save_request_inputs(self, messageInfo):
         try:
             ar = None
@@ -581,7 +609,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
                 if req:
                     ar = self._helpers.analyzeRequest(req)
 
-            collected = []
+            collected = []  # list of (name, value)
 
             # Always collect URL params + body/json/xml/multipart attrs
             if ar:
@@ -589,13 +617,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
                     try:
                         t = p.getType()
                         if t in (p.PARAM_URL, p.PARAM_BODY, p.PARAM_JSON, p.PARAM_XML, p.PARAM_XML_ATTR, p.PARAM_MULTIPART_ATTR):
+                            name = p.getName()
                             val = p.getValue()
                             if val:
-                                collected.append(val)
+                                collected.append((name, val))
                     except Exception:
                         continue
 
-            # Multipart fallback (in case some values aren't surfaced by Burp's parser)
+            # Multipart fallback (extract name from Content-Disposition)
             try:
                 req = messageInfo.getRequest()
                 if req and ar:
@@ -633,14 +662,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
                                             # Skip files
                                             if re.search(r'Content-Disposition:.*?filename\s*=\s*"', hdr, re.I):
                                                 continue
+                                            # Try to get the "name" attribute
+                                            name_m = re.search(r'name="([^"]*)"', hdr, re.I)
+                                            pname = name_m.group(1) if name_m else ""
                                             val = val.strip()
                                             if val:
-                                                collected.append(val)
+                                                collected.append((pname, val))
             except Exception:
                 pass
 
-            for v in collected:
-                self._write_input_value(v)
+            for (n, v) in collected:
+                self._write_input(n, v)
 
         except Exception:
             pass
@@ -671,8 +703,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
                 url = None
 
         path = (url.getPath() if url else "") or ""
-        if _is_js_path(path):
-            self._log("Skipping request for .js resource: %s" % (str(url) if url else "<no-url>"))
+        if _is_ignored_path(path):
+            self._log("Skipping ignored asset path: %s" % (str(url) if url else "<no-url>"))
             return issues
 
         method = ar.getMethod().upper() if ar else "GET"
@@ -773,8 +805,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IScannerCheck):
             url = None
 
         path = (url.getPath() if url else "") or ""
-        if _is_js_path(path):
-            self._log("Skipping response for .js resource: %s" % (str(url) if url else "<no-url>"))
+        if _is_ignored_path(path):
+            self._log("Skipping ignored asset path: %s" % (str(url) if url else "<no-url>"))
             return issues
 
         if self.scan_resp_headers:
