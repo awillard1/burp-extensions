@@ -3,6 +3,8 @@
 // - Pure-Java port (no JS engine).
 // - EU fast-path on entire path segment.
 // - Strict heuristics to cut false positives (toggleable in UI).
+// - Canonical URL-decode chain (handles double-encoding) across path/query/params/headers/body.
+// - Grid shows Token (pre-decoded/matched layer) and Decoded; detail dialog shows both.
 
 import burp.*;
 import javax.swing.*;
@@ -36,7 +38,6 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
 
     // Alphabets used by LZ-String
     private static final String EU_ALPHA  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-$";
-    @SuppressWarnings("unused")
     private static final String B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     // Candidate extraction: we URL-decode layers separately; no raw '%' in candidate pattern
@@ -45,8 +46,8 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
 
     // UI toggles
     private boolean scopeOnly      = true;
-    private boolean readableOnly   = true;  // keep, but quality gate is stronger now
-    private boolean strictMode     = true;  // NEW: strong heuristics ON by default
+    private boolean readableOnly   = true;  // keep; quality gate is stronger now
+    private boolean strictMode     = true;  // strong heuristics ON by default
     private boolean logAllAttempts = false; // optional verbose logging
 
     // UI
@@ -130,52 +131,64 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
         final String tool = callbacks.getToolName(toolFlag);
         final URL url = req.getUrl();
 
-        // ===== PATH handling: explicit split; EU fast-path on full segment =====
+        // ===== PATH handling: split raw path, and also split decoded variants =====
         String path = url.getPath();
         if (path != null && !path.isEmpty()) {
-            String normalized = path;
-            if (normalized.startsWith("/")) normalized = normalized.substring(1);
-            if (normalized.endsWith("/")) normalized = normalized.substring(0, normalized.length() - 1);
+            // Build raw + decoded layers for the *entire* path first
+            List<String> pathLayers = urlDecodeChain3(path);
 
-            if (!normalized.isEmpty()) {
+            for (int li = 0; li < pathLayers.size(); li++) {
+                String pLayer = pathLayers.get(li);
+                String layerTag = (li == 0 ? "" : "-dec" + li);
+
+                String normalized = pLayer;
+                if (normalized.startsWith("/")) normalized = normalized.substring(1);
+                if (normalized.endsWith("/")) normalized = normalized.substring(0, normalized.length() - 1);
+                if (normalized.isEmpty()) continue;
+
                 String[] segs = normalized.split("/");
                 for (int si = 0; si < segs.length; si++) {
                     String seg = segs[si];
                     if (seg == null || seg.isEmpty()) continue;
 
-                    harvestAndTry(seg, messageInfo, true, tool, "path-seg[" + si + "]-raw");
-
-                    if (seg.contains(";")) {
-                        String main = seg.split(";", 2)[0];
-                        String params = seg.substring(seg.indexOf(';') + 1);
-                        if (!main.isEmpty()) harvestAndTry(main, messageInfo, true, tool, "path-seg[" + si + "]-main");
-                        if (!params.isEmpty()) harvestAndTry(params, messageInfo, true, tool, "path-seg[" + si + "]-semiparams");
+                    // Segment-level: also decode twice (handles double-encoded segments)
+                    for (String segLayer : urlDecodeChain2(seg)) {
+                        harvestAndTry(segLayer, messageInfo, true, tool, "path-seg[" + si + "]" + layerTag);
+                        if (segLayer.contains(";")) {
+                            String main = segLayer.split(";", 2)[0];
+                            String params = segLayer.substring(segLayer.indexOf(';') + 1);
+                            if (!main.isEmpty()) harvestAndTry(main, messageInfo, true, tool, "path-seg[" + si + "]-main" + layerTag);
+                            if (!params.isEmpty()) harvestAndTry(params, messageInfo, true, tool, "path-seg[" + si + "]-semiparams" + layerTag);
+                        }
                     }
-
-                    String dec1 = urlDecode(seg);
-                    if (!dec1.equals(seg)) harvestAndTry(dec1, messageInfo, true, tool, "path-seg[" + si + "]-dec1");
-                    String dec2 = urlDecode(dec1);
-                    if (!dec2.equals(dec1)) harvestAndTry(dec2, messageInfo, true, tool, "path-seg[" + si + "]-dec2");
                 }
             }
         }
 
-        // PARAMETERS via Burp
+        // PARAMETERS via Burp (works across methods: GET/POST/PUT/…)
         for (IParameter p : req.getParameters()) {
             String v = p.getValue();
             if (v == null || v.isEmpty()) continue;
+
             int t = p.getType();
             String kind = (t == IParameter.PARAM_URL) ? "param-url:" + p.getName()
-                         : (t == IParameter.PARAM_BODY) ? "param-body:" + p.getName()
-                         : "param-" + t + ":" + p.getName();
-            harvestAndTry(v, messageInfo, true, tool, kind);
+                    : (t == IParameter.PARAM_BODY) ? "param-body:" + p.getName()
+                    : "param-" + t + ":" + p.getName();
+
+            for (String vLayer : urlDecodeChain3(v)) {
+                harvestAndTry(vLayer, messageInfo, true, tool, kind);
+            }
         }
 
-        // RAW QUERY
+        // RAW QUERY (entire query string)
         String q = url.getQuery();
-        if (q != null && !q.isEmpty()) harvestAndTry(q, messageInfo, true, tool, "query-raw");
+        if (q != null && !q.isEmpty()) {
+            for (String qLayer : urlDecodeChain3(q)) {
+                harvestAndTry(qLayer, messageInfo, true, tool, "query");
+            }
+        }
 
-        // HEADERS (skip noisy)
+        // HEADERS (skip noisy), but allow minimal decode of values
         for (String h : req.getHeaders()) {
             int idx = h.indexOf(':');
             if (idx < 0) continue;
@@ -190,41 +203,68 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
                 lname.equals("accept-encoding") || lname.equals("priority")) {
                 continue;
             }
-            harvestAndTry(val, messageInfo, true, tool, "header:" + name);
+            for (String vLayer : urlDecodeChain2(val)) {
+                harvestAndTry(vLayer, messageInfo, true, tool, "header:" + name);
+            }
         }
 
-        // BODY
+        // BODY (as text; param extraction above already covers key/vals for known types)
         byte[] body = Arrays.copyOfRange(messageInfo.getRequest(), req.getBodyOffset(), messageInfo.getRequest().length);
-        if (body.length > 0) harvestAndTry(new String(body, StandardCharsets.UTF_8), messageInfo, true, tool, "body");
+        if (body.length > 0) {
+            String bodyStr = new String(body, StandardCharsets.UTF_8);
+            for (String bLayer : urlDecodeChain3(bodyStr)) {
+                harvestAndTry(bLayer, messageInfo, true, tool, "body");
+            }
+        }
     }
 
-    /** EU fast-path on full string (raw/dec1/dec2) if it looks EU-ish; then token harvesting. */
+    // ===================== URL decode chains =====================
+
+    /** Decode up to `max` times; stop early when decoding no longer changes the string. */
+    private List<String> urlDecodeChain(String s, int max) {
+        ArrayList<String> layers = new ArrayList<>(max + 1);
+        if (s == null) return layers;
+        String prev = s;
+        layers.add(prev);
+        for (int i = 0; i < max; i++) {
+            String dec = urlDecode(prev);
+            if (dec.equals(prev)) break;     // stable -> stop
+            layers.add(dec);
+            prev = dec;
+        }
+        // Deduplicate while preserving order
+        LinkedHashSet<String> uniq = new LinkedHashSet<>(layers);
+        return new ArrayList<>(uniq);
+    }
+    private List<String> urlDecodeChain2(String s) { return urlDecodeChain(s, 2); }
+    private List<String> urlDecodeChain3(String s) { return urlDecodeChain(s, 3); }
+
+    private String urlDecode(String s) { try { return helpers.urlDecode(s); } catch (Exception e) { return s; } }
+
+    // ===================== Core harvest/try =====================
+
+    /** Canonical-first decode/scan across multiple URL-decoded layers (raw, dec1, dec2...). */
     private void harvestAndTry(String s, IHttpRequestResponse msg, boolean isReq, String tool, String origin) {
         if (s == null || s.isEmpty()) return;
 
-        // -------- FAST PATH: try EU on whole string if it "looks" EU-ish --------
-        if (looksLikeEU(s)) {
-            String out = tryEU(s);
-            if (accept(out)) { recordResult(msg, isReq, tool, s, out, origin + "-EU-fast"); return; }
+        // Build layers: raw -> dec1 -> dec2 (no duplicates)
+        List<String> layers = urlDecodeChain3(s);
 
-            String d1 = urlDecode(s);
-            if (!d1.equals(s) && looksLikeEU(d1)) {
-                out = tryEU(d1);
-                if (accept(out)) { recordResult(msg, isReq, tool, s, out, origin + "-EU-fast-dec1"); return; }
-            }
-            String d2 = urlDecode(d1);
-            if (!d2.equals(d1) && looksLikeEU(d2)) {
-                out = tryEU(d2);
-                if (accept(out)) { recordResult(msg, isReq, tool, s, out, origin + "-EU-fast-dec2"); return; }
+        // ---- FAST PATH EU on each layer (canonical-first) ----
+        for (int i = 0; i < layers.size(); i++) {
+            String layer = layers.get(i);
+            if (!looksLikeEU(layer)) continue;
+            String out = tryEU(layer);
+            if (accept(out)) {
+                String tag = origin + (i == 0 ? "-EU-fast" : "-EU-fast-dec" + i);
+                recordResult(msg, isReq, tool, layer, out, tag);
+                return;
             }
         }
 
-        // -------- FALLBACK: token harvesting on RAW/dec1/dec2 --------
-        String[] layers = new String[]{ s, urlDecode(s), null };
-        layers[2] = urlDecode(layers[1]);
-
-        for (int i = 0; i < layers.length; i++) {
-            String layer = layers[i];
+        // ---- FALLBACK: token harvesting on each layer ----
+        for (int i = 0; i < layers.size(); i++) {
+            String layer = layers.get(i);
             if (layer == null || layer.isEmpty()) continue;
 
             Matcher m = CANDIDATE.matcher(layer);
@@ -244,7 +284,8 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
                 }
 
                 if (accept(res)) {
-                    recordResult(msg, isReq, tool, cand, res, origin + (i == 0 ? "" : "-dec" + i));
+                    String tag = origin + (i == 0 ? "" : "-dec" + i);
+                    recordResult(msg, isReq, tool, cand, res, tag);
                     return; // one hit per origin is enough
                 }
             }
@@ -373,7 +414,7 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
             }
             return true;
         }
-        // Quick signals: URL-ish / key:value-ish
+        // Quick signals: URL-ish / key:value-ish / email-ish
         if (t.startsWith("http://") || t.startsWith("https://")) return true;
         if (t.indexOf(':') > 0 && t.indexOf(',') > 0) return true;
         if (t.indexOf('@') > 0 && t.indexOf('.', t.indexOf('@')) > t.indexOf('@')) return true;
@@ -479,40 +520,37 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
         JOptionPane.showMessageDialog(panel, new JScrollPane(ta), "Decode Result", JOptionPane.PLAIN_MESSAGE);
     }
 
-	private void showDetailDialog(DecodeResult r) {
-		JDialog d = new JDialog((Frame) null, "LZString – Details", true);
-		d.setLayout(new BorderLayout());
+    private void showDetailDialog(DecodeResult r) {
+        JDialog d = new JDialog((Frame) null, "LZString – Details", true);
+        d.setLayout(new BorderLayout());
 
-		JTextArea taDecoded = new JTextArea(r.decoded, 24, 80);
-		taDecoded.setEditable(false);
+        JTextArea taDecoded = new JTextArea(r.decoded, 24, 80);
+        taDecoded.setEditable(false);
 
-		JTextArea taToken = new JTextArea(r.token, 24, 60);
-		taToken.setEditable(false);
+        JTextArea taToken = new JTextArea(r.token, 24, 60);
+        taToken.setEditable(false);
 
-		JScrollPane spDecoded = new JScrollPane(taDecoded);
-		spDecoded.setBorder(BorderFactory.createTitledBorder("Decoded"));
+        JScrollPane spDecoded = new JScrollPane(taDecoded);
+        spDecoded.setBorder(BorderFactory.createTitledBorder("Decoded"));
 
-		JScrollPane spToken = new JScrollPane(taToken);
-		spToken.setBorder(BorderFactory.createTitledBorder("Token (raw)"));
+        JScrollPane spToken = new JScrollPane(taToken);
+        spToken.setBorder(BorderFactory.createTitledBorder("Token (raw)"));
 
-		JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, spDecoded, spToken);
-		split.setResizeWeight(0.65); // favor decoded pane
-		d.add(split, BorderLayout.CENTER);
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, spDecoded, spToken);
+        split.setResizeWeight(0.65); // favor decoded pane
+        d.add(split, BorderLayout.CENTER);
 
-		// Footer with small context
-		JPanel footer = new JPanel(new GridLayout(2, 1));
-		JLabel lbl1 = new JLabel("Origin: " + r.origin + "    Host: " + r.host + ":" + r.port);
-		JLabel lbl2 = new JLabel("Tool: " + r.tool + "    Token length: " + r.tokenLen + "    Type: " + (r.isRequest ? "Request" : "Response"));
-		footer.add(lbl1);
-		footer.add(lbl2);
-		d.add(footer, BorderLayout.SOUTH);
+        JPanel footer = new JPanel(new GridLayout(2, 1));
+        JLabel lbl1 = new JLabel("Origin: " + r.origin + "    Host: " + r.host + ":" + r.port);
+        JLabel lbl2 = new JLabel("Tool: " + r.tool + "    Token length: " + r.tokenLen + "    Type: " + (r.isRequest ? "Request" : "Response"));
+        footer.add(lbl1);
+        footer.add(lbl2);
+        d.add(footer, BorderLayout.SOUTH);
 
-		d.pack();
-		d.setLocationRelativeTo(panel);
-		d.setVisible(true);
-	}
-
-    private String urlDecode(String s) { try { return helpers.urlDecode(s); } catch (Exception e) { return s; } }
+        d.pack();
+        d.setLocationRelativeTo(panel);
+        d.setVisible(true);
+    }
 
     private String normalizeBase64(String s) {
         String t = s.replace('-', '+').replace('_', '/');
@@ -525,33 +563,30 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
     private String shorten(String s) { return (s == null) ? "null" : (s.length() > 80 ? s.substring(0, 77) + "..." : s); }
 
     // ===================== Table / DTO / Issue =====================
-	private class ResultsTableModel extends AbstractTableModel {
-		// Added a "Token" column (pre-decoded value) and renamed "Preview" -> "Decoded"
-		private final String[] cols = {"#", "Type", "Host", "Port", "Tool", "Origin", "Len", "Token", "Decoded"};
+    private class ResultsTableModel extends AbstractTableModel {
+        // Added a "Token" column (pre-decoded/matched layer) and "Decoded".
+        private final String[] cols = {"#", "Type", "Host", "Port", "Tool", "Origin", "Len", "Token", "Decoded"};
 
-		@Override public int getRowCount() { return results.size(); }
-		@Override public int getColumnCount() { return cols.length; }
-		@Override public String getColumnName(int c) { return cols[c]; }
+        @Override public int getRowCount() { return results.size(); }
+        @Override public int getColumnCount() { return cols.length; }
+        @Override public String getColumnName(int c) { return cols[c]; }
 
-		@Override public Object getValueAt(int r, int c) {
-			DecodeResult dr = results.get(r);
-			switch (c) {
-				case 0: return r + 1;
-				case 1: return dr.isRequest ? "Req" : "Resp";
-				case 2: return dr.host;
-				case 3: return dr.port;
-				case 4: return dr.tool;
-				case 5: return dr.origin;
-				case 6: return dr.tokenLen;
-				case 7: // Token preview (raw)
-					return dr.token.length() > 50 ? dr.token.substring(0, 47) + "..." : dr.token;
-				case 8: // Decoded preview
-					return dr.decoded.length() > 50 ? dr.decoded.substring(0, 47) + "..." : dr.decoded;
-				default: return "";
-			}
-		}
-	}
-
+        @Override public Object getValueAt(int r, int c) {
+            DecodeResult dr = results.get(r);
+            switch (c) {
+                case 0: return r + 1;
+                case 1: return dr.isRequest ? "Req" : "Resp";
+                case 2: return dr.host;
+                case 3: return dr.port;
+                case 4: return dr.tool;
+                case 5: return dr.origin;
+                case 6: return dr.tokenLen;
+                case 7: return dr.token.length() > 50 ? dr.token.substring(0, 47) + "..." : dr.token; // Token preview
+                case 8: return dr.decoded.length() > 50 ? dr.decoded.substring(0, 47) + "..." : dr.decoded; // Decoded preview
+                default: return "";
+            }
+        }
+    }
 
     private static class DecodeResult {
         final long time; final boolean isRequest; final String host; final int port;
