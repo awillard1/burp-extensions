@@ -9,7 +9,7 @@ https://www.oracle.com/java/technologies/downloads
 ```
 
 ---
-### Installation
+### Build and Installation
 #### Download the files
 #### Compile
 ###### Windows
