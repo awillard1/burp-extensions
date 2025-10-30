@@ -15,3 +15,4 @@ javac -cp "C:\Users\<YOUR_USERNAME>\AppData\Local\BurpSuitePro\burpsuite_pro.jar
 javac -cp "burpsuite_pro.jar" LZStringDetector.java BurpExtender.java --release 21
 jar cvf LZStringDetector.jar *
 ```
+###### Load the jar in burp extensions as Java
