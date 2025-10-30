@@ -1,3 +1,10 @@
+### $\color{red}{\text{PRE REQUISITES}}$
+***Python/Python3 must have lzstring installed (windows/linux)***
+```
+python3 -m pip install lzstring
+```
+
+### Installation
 #### Download the files
 #### Ensure you have a jdk (download and install if not)
 https://www.oracle.com/java/technologies/downloads
