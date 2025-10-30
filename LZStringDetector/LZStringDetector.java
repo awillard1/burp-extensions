@@ -1,10 +1,11 @@
 // LZStringDetector.java
 // Burp Suite Java Extension – Detects & decodes LZ-String (EncodedURIComponent, Base64, UTF16)
 // - Pure-Java port (no JS engine).
-// - EU fast-path on entire path segment.
+// - EU fast-path on entire path segment and other layers.
 // - Strict heuristics to cut false positives (toggleable in UI).
 // - Canonical URL-decode chain (handles double-encoding) across path/query/params/headers/body.
 // - Grid shows Token (pre-decoded/matched layer) and Decoded; detail dialog shows both.
+// - "Test Decode" (decode a token) and "Make Token" (compress input to LZ-String Base64).
 
 import burp.*;
 import javax.swing.*;
@@ -20,6 +21,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+
 
 public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
 
@@ -55,6 +57,49 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
     private JTable resultsTable;
     private ResultsTableModel tableModel;
     private final List<DecodeResult> results = new ArrayList<>();
+	
+	private String compressToBase64ViaPython(String src) {
+		// Try python3 then python (Windows sometimes maps to 'python')
+		String[] candidates = new String[] {
+				"python3", "python"
+		};
+
+		// The Python snippet reads payload from STDIN to avoid any shell quoting issues.
+		final String py = ""
+			+ "import sys, json\n"
+			+ "from lzstring import LZString\n"
+			+ "data = sys.stdin.read()\n"
+			+ "print(LZString().compressToBase64(data), end='')\n";
+
+		for (String exe : candidates) {
+			try {
+				ProcessBuilder pb = new ProcessBuilder(exe, "-c", py);
+				// Ensure no inherited proxy/env issues
+				pb.redirectErrorStream(true);
+				Process p = pb.start();
+
+				// Write the payload to stdin
+				try (OutputStream os = p.getOutputStream()) {
+					os.write(src.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+				}
+
+				// Read all output
+				String out;
+				try (InputStream is = p.getInputStream()) {
+					out = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+				}
+
+				int code = p.waitFor();
+				if (code == 0 && out != null && !out.isEmpty()) {
+					return out.trim();
+				}
+			} catch (Exception ignore) {
+				// try next candidate
+			}
+		}
+		return null; // not available / failed
+	}
+
 
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks cb) {
@@ -75,7 +120,7 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
     private void buildUI() {
         panel = new JPanel(new BorderLayout());
 
-        JPanel top = new JPanel(new GridLayout(1, 8));
+        JPanel top = new JPanel(new GridLayout(1, 10));
         top.setBorder(BorderFactory.createTitledBorder("Config"));
 
         JCheckBox cbScope = new JCheckBox("Scope only", scopeOnly);
@@ -105,6 +150,10 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
         JButton btnTest = new JButton("Test Decode");
         btnTest.addActionListener(e -> testManualDecode());
         top.add(btnTest);
+
+        JButton btnMake = new JButton("Make Token");
+        btnMake.addActionListener(e -> makeTokenDialog());
+        top.add(btnMake);
 
         panel.add(top, BorderLayout.NORTH);
 
@@ -520,6 +569,76 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
         JOptionPane.showMessageDialog(panel, new JScrollPane(ta), "Decode Result", JOptionPane.PLAIN_MESSAGE);
     }
 
+    private void makeTokenDialog() {
+		JTextArea input = new JTextArea(10, 80);
+		input.setLineWrap(true);
+		input.setWrapStyleWord(true);
+
+		JPanel p = new JPanel(new BorderLayout(8, 8));
+		p.add(new JScrollPane(input), BorderLayout.CENTER);
+
+		int rc = JOptionPane.showConfirmDialog(
+				panel, p, "LZString – Compress to Base64", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+		if (rc != JOptionPane.OK_OPTION) return;
+
+		final String src = Optional.ofNullable(input.getText()).orElse("");
+		if (src.length() > 1_000_000) { // 1 MB guardrail
+			int ok = JOptionPane.showConfirmDialog(panel,
+					"Payload is large (" + src.length() + " chars). Proceed?",
+					"Large input", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+			if (ok != JOptionPane.OK_OPTION) return;
+		}
+
+		final JDialog progress = new JDialog((Frame) null, "Compressing…", true);
+		progress.setLayout(new BorderLayout());
+		progress.add(new JLabel("Building LZ-String Base64…"), BorderLayout.CENTER);
+		progress.setSize(320, 90);
+		progress.setLocationRelativeTo(panel);
+
+		SwingWorker<String, Void> worker = new SwingWorker<String, Void>() {
+			@Override protected String doInBackground() {
+				String py = compressToBase64ViaPython(src);
+				return py != null ? py : "";
+			}
+
+			@Override protected void done() {
+				progress.dispose();
+				String b64 = "";
+				try { b64 = get(); } catch (Exception ex) { stderr.println("[LZString] Make Token error: " + ex); }
+				JTextArea out = new JTextArea(b64 == null ? "" : b64, 12, 80);
+				out.setEditable(false);
+
+				JButton copy = new JButton("Copy");
+				final String toCopy = (b64 == null ? "" : b64);
+				copy.addActionListener(ev -> {
+					try {
+						java.awt.datatransfer.StringSelection ss = new java.awt.datatransfer.StringSelection(toCopy);
+						java.awt.Toolkit.getDefaultToolkit().getSystemClipboard().setContents(ss, null);
+					} catch (Exception ex) {
+						stderr.println("[LZString] Clipboard error: " + ex);
+					}
+				});
+
+				JPanel south = new JPanel(new FlowLayout(FlowLayout.LEFT));
+				south.add(new JLabel("Base64 length: " + toCopy.length()));
+				south.add(copy);
+
+				JPanel wrap = new JPanel(new BorderLayout(8, 8));
+				wrap.add(new JScrollPane(out), BorderLayout.CENTER);
+				wrap.add(south, BorderLayout.SOUTH);
+
+				JOptionPane.showMessageDialog(panel, wrap, "LZString – Base64", JOptionPane.PLAIN_MESSAGE);
+			}
+		};
+
+		// kick it off
+		new Thread(() -> {
+			worker.execute();
+			progress.setVisible(true);
+		}).start();
+	}
+
+
     private void showDetailDialog(DecodeResult r) {
         JDialog d = new JDialog((Frame) null, "LZString – Details", true);
         d.setLayout(new BorderLayout());
@@ -628,13 +747,14 @@ public class LZStringDetector implements IBurpExtender, IHttpListener, ITab {
 }
 
 /* ==========================
- * Known-good pure-Java LZString port
- * (decompressFromBase64 / EncodedURIComponent / UTF16)
+ * Pure-Java LZString port
+ * (decompressFromBase64 / EncodedURIComponent / UTF16 + compressToBase64)
  * ========================== */
 class LZStringJava {
     private static final String BASE64_ALPHABET   = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     private static final String URI_SAFE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-$";
 
+    // ---------- Decompression ----------
     public static String decompressFromBase64(String input) {
         if (input == null) return null;
         final String s = input; // effectively final for lambda
@@ -653,7 +773,6 @@ class LZStringJava {
         return decompress(s.length(), 16384, idx -> ((int) s.charAt(idx)) - 32);
     }
 
-    // ---------- Core ----------
     private interface CharProvider { int at(int index); }
 
     private static String decompress(int length, int resetValue, CharProvider getBase) {
@@ -749,7 +868,6 @@ class LZStringJava {
         int val;
         int position;
         int resetValue;
-
         Data(int index, int firstVal, int resetValue) {
             this.index = index;
             this.val = firstVal;
