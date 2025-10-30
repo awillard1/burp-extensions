@@ -5,6 +5,7 @@ python3 -m pip install lzstring
 ```
 ***Ensure you have a jdk (download and install if not)***
 https://www.oracle.com/java/technologies/downloads
+
 ---
 ### Installation
 #### Download the files
