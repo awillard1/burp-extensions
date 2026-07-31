@@ -389,6 +389,25 @@ def analyze_text(text, rule_prefix_filter=None):
                 for m in pat.finditer(text):
                     if count >= MAX_MATCHES_PER_RULE:
                         break
+
+                    # Suppress exact javascript:void(0)-style no-op URLs
+                    # for JS-URL-JS-001 (optionally quoted / spaced / trailing ;)
+                    # NOTE: m.group(0) is often just "javascript:", so inspect nearby text.
+                    if rid in ("JS-URL-JS-001", "HTML-JS-URL-001"):
+                        try:
+                            tail = text[m.start(): m.start() + 240]
+                        except Exception:
+                            tail = ""
+
+                        # Suppress common no-op javascript URLs:
+                        # javascript:void(0), javascript:void(0);, javascript:;
+                        if re.search(
+                            r"javascript\s*:\s*(?:void\s*\(\s*0\s*\)\s*;?|;)(?:[\s'\"`>)\]]|$)",
+                            tail,
+                            re.I
+                        ):
+                            continue
+
                     findings.append({
                         "rule_id": rid,
                         "title": rule["title"],
@@ -1106,6 +1125,251 @@ def scan_source_sink_heuristic(js_text):
                 "snippet": _snippet(js_text, sidx)[:450],
             })
     return findings
+
+# ---------------------------------------------------------------------------
+# Context-aware analyzer (taint + sink gating) to reduce false positives
+# ---------------------------------------------------------------------------
+
+JS_ASSIGN_RE = re.compile(
+    r"\b([A-Za-z_$][\w$]{0,80})\s*=\s*([^;\n]{1,500})",
+    re.M
+)
+
+JS_SOURCE_EXPR_RE = re.compile(
+    r"(location\.(?:search|hash|href)|document\.(?:cookie|URL|referrer|baseURI)|"
+    r"URLSearchParams\s*\(|window\.name|document\.location|"
+    r"(?:local|session)Storage\s*\.\s*getItem\s*\(|"
+    r"event\.data|message\.data)",
+    re.I
+)
+
+JS_URL_SINK_RE = re.compile(
+    r"(\.\s*(?:href|src|action)\s*=|"
+    r"\blocation\.(?:href|assign|replace)\s*(?:=|\()|"
+    r"\bwindow\.location\s*=|"
+    r"\bsetAttribute\s*\(\s*['\"](?:href|src|action|formaction)['\"]\s*,)",
+    re.I
+)
+
+JS_DANGEROUS_SCHEME_RE = re.compile(r"javascript\s*:", re.I)
+
+HTML_JS_URL_ATTR_RE = re.compile(
+    r"\b(?:href|src|action|formaction)\s*=\s*([\"'])(.*?)\1",
+    re.I | re.S
+)
+
+JS_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_$][\w$]{0,80}\b")
+
+
+class ContextualAnalyzer(object):
+    def __init__(self, text, kind):
+        self.text = text or ""
+        self.kind = kind  # "js" or "html"
+        self.lines = self.text.splitlines()
+        self.tainted = set()
+        self.assignments = []   # list of dict: {name, expr, idx, line}
+        self.url_sinks = []     # list of dict: {expr, idx, line, raw}
+        self._build_state()
+
+    def _line(self, idx):
+        return _line_number(self.text, max(0, idx))
+
+    def _build_state(self):
+        if self.kind != "js" or not self.text:
+            return
+
+        # 1) collect assignments
+        for m in JS_ASSIGN_RE.finditer(self.text):
+            name = m.group(1) or ""
+            expr = (m.group(2) or "").strip()
+            self.assignments.append({
+                "name": name,
+                "expr": expr,
+                "idx": m.start(),
+                "line": self._line(m.start()),
+            })
+
+        # 2) seed taint from direct source expressions
+        changed = True
+        for a in self.assignments:
+            if JS_SOURCE_EXPR_RE.search(a["expr"]):
+                self.tainted.add(a["name"])
+
+        # 3) iterate propagation through identifiers
+        # lightweight fixed-point
+        max_rounds = 6
+        rounds = 0
+        while changed and rounds < max_rounds:
+            changed = False
+            rounds += 1
+            for a in self.assignments:
+                if a["name"] in self.tainted:
+                    continue
+                ids = set(JS_IDENTIFIER_RE.findall(a["expr"] or ""))
+                if ids.intersection(self.tainted):
+                    self.tainted.add(a["name"])
+                    changed = True
+
+        # 4) collect URL-like sinks with RHS expression window
+        for m in JS_URL_SINK_RE.finditer(self.text):
+            idx = m.start()
+            line = self._line(idx)
+            window = self.text[idx:min(len(self.text), idx + 420)]
+
+            # heuristic extraction of RHS for "= ..." or arg for setAttribute
+            expr = window
+            eq_pos = window.find("=")
+            if eq_pos != -1:
+                expr = window[eq_pos + 1:eq_pos + 220]
+            elif "setAttribute" in window:
+                comma = window.find(",")
+                if comma != -1:
+                    expr = window[comma + 1:comma + 220]
+
+            self.url_sinks.append({
+                "expr": expr.strip(),
+                "idx": idx,
+                "line": line,
+                "raw": window[:260],
+            })
+
+    def _expr_is_tainted(self, expr):
+        if not expr:
+            return False
+        if JS_SOURCE_EXPR_RE.search(expr):
+            return True
+        ids = set(JS_IDENTIFIER_RE.findall(expr))
+        if ids.intersection(self.tainted):
+            return True
+        return False
+
+    def _find_nearby_url_sink(self, line, radius=4):
+        for s in self.url_sinks:
+            if abs((s.get("line") or 0) - (line or 0)) <= radius:
+                return s
+        return None
+
+    def validate(self, finding):
+        rid = finding.get("rule_id", "")
+        line = finding.get("line", 0)
+        match = finding.get("match", "") or ""
+        snippet = finding.get("snippet", "") or ""
+
+        # --- JS-URL-JS-001 ---
+        if rid == "JS-URL-JS-001":
+            if self.kind != "js":
+                return None
+
+            sink = self._find_nearby_url_sink(line, radius=5)
+
+            # If not tied to actual navigation/resource sink -> suppress
+            if not sink:
+                return None
+
+            expr = (sink.get("expr") or "") + " " + match + " " + snippet
+            tainted = self._expr_is_tainted(expr)
+
+            # static javascript:void(0) etc. without taint => informational hygiene
+            if not tainted:
+                lowered = expr.lower()
+                if "javascript:void(0" in lowered or "javascript:;" in lowered:
+                    finding["severity"] = "info"
+                    finding["confidence"] = "medium"
+                    finding["detail"] = (
+                        "javascript: scheme assigned to URL sink, but no user-controlled "
+                        "data flow detected nearby. Treat as hygiene/CSP concern unless "
+                        "runtime data binding changes this."
+                    )
+                    return finding
+                return None
+
+            finding["severity"] = "high"
+            finding["confidence"] = "high"
+            finding["detail"] = (
+                "Potential user-controlled flow into javascript: URL sink. "
+                "Source/propagation evidence suggests attacker influence. "
+                "Validate exploitability with DOM Invader."
+            )
+            return finding
+
+        # --- HTML-JS-URL-001 ---
+        if rid == "HTML-JS-URL-001":
+            if self.kind != "html":
+                return finding
+
+            blob = (match + " " + snippet).lower()
+
+            # Suppress common no-op javascript anchors
+            if re.search(r"javascript\s*:\s*(?:void\s*\(\s*0\s*\)\s*;?|;)\b", blob, re.I):
+                return None
+
+            # Determine if this is likely static attribute vs dynamic tainted composition
+            # For raw HTML response scanning, mostly static; downgrade unless dynamic markers
+            blob = (match + " " + snippet).lower()
+            dynamic_markers = ("${", "{{", "<%=", "concat(", "+")
+            has_dynamic_marker = any(dm in blob for dm in dynamic_markers)
+
+            if has_dynamic_marker:
+                finding["severity"] = "medium"
+                finding["confidence"] = "medium"
+                finding["detail"] = (
+                    "javascript: URL found with dynamic composition markers. "
+                    "Potentially exploitable if attacker controls injected segment."
+                )
+                return finding
+
+            # Static literal in HTML should be low/info, not high vulnerability by default
+            finding["severity"] = "low"
+            finding["confidence"] = "high"
+            finding["detail"] = (
+                "Static javascript: URL attribute found. Usually a security hygiene / CSP "
+                "issue unless user-controlled data can influence the attribute at runtime."
+            )
+            return finding
+
+        # --- JS-DOM-XSS-004 (href/src/action/location assignments) ---
+        if rid == "JS-DOM-XSS-004":
+            if self.kind != "js":
+                return None
+            sink = self._find_nearby_url_sink(line, radius=5)
+            if not sink:
+                return None
+            expr = (sink.get("expr") or "") + " " + snippet
+            tainted = self._expr_is_tainted(expr)
+
+            if not tainted:
+                # keep as weaker signal, not medium-by-default
+                finding["severity"] = "low"
+                finding["confidence"] = "low"
+                finding["detail"] = (
+                    "URL/resource sink assignment found without clear user-controlled source "
+                    "flow in local context."
+                )
+                return finding
+
+            finding["severity"] = "medium"
+            finding["confidence"] = "medium"
+            finding["detail"] = (
+                "Potential user-controlled flow into navigation/resource sink. "
+                "Validate allowlisting and scheme restrictions."
+            )
+            return finding
+
+        # default: keep existing finding
+        return finding
+
+    def run(self, findings):
+        out = []
+        for f in findings or []:
+            try:
+                vf = self.validate(dict(f))
+                if vf is not None:
+                    out.append(vf)
+            except Exception:
+                # fail-open for non-target rules
+                out.append(f)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # SQL false-positive gate
@@ -2007,14 +2271,29 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
         findings = []
         if not code:
             return findings
+
         base = analyze_text(code, "js_only")
         sec = scan_generic_secrets(code)
         taint = scan_source_sink_heuristic(code) if self.ui.scan_taint_enabled() else []
         allf = base + sec + taint
+
+        # NEW: context-aware gating for noisy JS rules
+        try:
+            ca = ContextualAnalyzer(code, "js")
+            allf = ca.run(allf)
+        except Exception as ex:
+            self._stderr.println("[JS-Audit] ContextualAnalyzer(js) error: %s" % ex)
+
         for f in allf:
             f["title"] = "[%s] %s" % (label, f["title"])
             f["detail"] = "Found in %s. %s" % (label, f["detail"])
         findings.extend(allf)
+        return findings
+
+    def _scan_js_fragment(self, code, label, baseRequestResponse=None, url=None, allowed=None, want_semgrep=False):
+        findings = self._scan_js_fragment_fast(code, label)
+        if want_semgrep and baseRequestResponse is not None and url is not None:
+            self._schedule_semgrep(code, label, baseRequestResponse, url, allowed or set())
         return findings
 
     def _scan_js_fragment(self, code, label, baseRequestResponse=None, url=None, allowed=None, want_semgrep=False):
@@ -2094,7 +2373,13 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
             if "html" in kinds and want_html:
                 html_key = self._scan_key(url_str, "html-rules", text, False, "", False)
                 if not self._scan_cache.seen(html_key):
-                    findings.extend(analyze_text(text, "html_only"))
+                    html_findings = analyze_text(text, "html_only")
+                    try:
+                        ca_html = ContextualAnalyzer(text, "html")
+                        html_findings = ca_html.run(html_findings)
+                    except Exception as ex:
+                        self._stderr.println("[JS-Audit] ContextualAnalyzer(html) error: %s" % ex)
+                    findings.extend(html_findings)
                     self._scan_cache.mark(html_key)
 
                 if want_js:
@@ -2144,7 +2429,13 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
                     key = self._scan_key(url_str, "manual-html-rules", text, False, "", False)
                     if not self._scan_cache.seen(key):
                         self._scan_cache.mark(key)
-                        findings.extend(analyze_text(text, "html_only"))
+                        html_findings = analyze_text(text, "html_only")
+                        try:
+                            ca_html = ContextualAnalyzer(text, "html")
+                            html_findings = ca_html.run(html_findings)
+                        except Exception as ex:
+                            self._stderr.println("[JS-Audit] ContextualAnalyzer(html) error: %s" % ex)
+                        findings.extend(html_findings)
                 if want_js:
                     key = self._scan_key(url_str, "manual-js", text, semgrep_on, packs_csv, taint_on)
                     if not self._scan_cache.seen(key):
