@@ -169,13 +169,21 @@ _add("JS-CRYPTO-WEAK-HASH-001", "Weak cryptographic hash reference (MD5 / SHA-1)
      "medium", "medium",
      "References to weak hash algorithms (MD5/SHA-1).",
      "Use modern hashes (SHA-256+) and current cryptographic guidance.",
-     [r"\b(?:md5|sha1)\b"], "crypto")
+     [
+         r"(?:createHash|createHmac|crypto\.subtle|\.digest\s*\(|algorithm\s*[:=])[^\n]{0,40}\b(?:md5|sha-?1)\b",
+         r"\b(?:md5|sha1)\s*\(",
+     ],
+     "crypto")
 
 _add("JS-CRYPTO-WEAK-CIPHER-001", "Weak cryptographic cipher/mode reference (DES / RC4 / AES-ECB)",
      "high", "medium",
      "References to weak/broken ciphers or modes (DES, RC4, AES-ECB).",
      "Use modern primitives and modes (e.g., AES-GCM) via Web Crypto or a well-reviewed library.",
-     [r"\b(?:des|rc4|aes-?ecb|aes_ecb)\b"], "crypto")
+     [
+         r"(?:createCipher|createDecipher|algorithm\s*[:=]|mode\s*[:=])[^\n]{0,40}\b(?:des|rc4|aes-?ecb|aes_ecb)\b",
+         r"\b(?:des|rc4)\s*\(",
+     ],
+     "crypto")
 
 _add("JS-RAND-001", "Math.random() used (not CSPRNG)",
      "low", "low",
@@ -265,7 +273,7 @@ _add("JS-SQL-001", "Possible SQL query built via concatenation / interpolation",
 
 # --- HTML ---
 _add("HTML-EVENT-001", "Inline event handler attribute",
-     "medium", "high",
+     "low", "high",
      "Inline on* handlers are XSS sink points and complicate CSP.",
      "Move handlers to external JS via addEventListener. Enforce a strict CSP.",
      [r"\son(?:click|error|load|mouseover|focus|blur|submit|change|input|keyup|keydown|mouseenter|mouseleave)\s*=\s*['\"][^'\"]+['\"]",
@@ -287,7 +295,7 @@ _add("HTML-SCRIPT-SRC-HTTP-001", "Script loaded over HTTP",
      [r"<script[^>]+src\s*=\s*['\"]http://"], "html")
 
 _add("HTML-SCRIPT-INLINE-001", "Inline script block present",
-     "low", "high",
+     "info", "high",
      "Inline scripts enlarge XSS impact and make CSP harder.",
      "Move scripts to external files and use CSP nonces or hashes.",
      [r"<script(?![^>]*\bsrc\s*=)[^>]*>"], "html")
@@ -342,6 +350,19 @@ def extract_javascript_url_payloads(html):
             out.append({"name": "javascript:", "code": code, "idx": m.start()})
     return out
 
+def _looks_like_minified_bundle(text):
+    """Heuristic: large, low-newline files with webpack markers are vendor bundles."""
+    if not text or len(text) < 4000:
+        return False
+    nl = text.count("\n")
+    if nl < max(3, len(text) / 500):
+        if re.search(r"webpackJsonp|__webpack_require__|webpackChunk", text[:8000]):
+            return True
+        if len(text) > 50000 and nl < 30:
+            return True
+    return False
+
+
 def classify_content(url, content_type, body):
     kinds = set()
     u = (url or "").lower().split("?")[0]
@@ -381,13 +402,19 @@ def analyze_text(text, rule_prefix_filter=None):
         if not rule["patterns"]:
             continue
 
+        max_for_rule = MAX_MATCHES_PER_RULE
+        if rid in ("JS-DOM-XSS-001", "JS-DOM-XSS-003", "JS-DOM-XSS-004",
+                   "JS-RAND-001", "HTML-EVENT-001", "JS-COOKIE-001",
+                   "JS-CRYPTO-WEAK-HASH-001", "JS-CRYPTO-WEAK-CIPHER-001"):
+            max_for_rule = 3
+
         count = 0
         for pat in rule["patterns"]:
-            if count >= MAX_MATCHES_PER_RULE:
+            if count >= max_for_rule:
                 break
             try:
                 for m in pat.finditer(text):
-                    if count >= MAX_MATCHES_PER_RULE:
+                    if count >= max_for_rule:
                         break
 
                     # Suppress exact javascript:void(0)-style no-op URLs
@@ -550,13 +577,50 @@ def _extract_string_literal_at(text, pos):
         i += 1
     return None, pos
 
+def _extract_rhs_expr(text, pos, max_len=900):
+    """
+    Capture a RHS that is a string/template or a simple concatenation of them.
+    Stops at top-level ; , or newline (for non-template).
+    """
+    if pos >= len(text):
+        return None, pos
+    # Prefer full string/template literal first
+    lit, end = _extract_string_literal_at(text, pos)
+    if lit:
+        # Extend through + "..." / + `...` chains
+        expr = lit
+        i = end
+        n = len(text)
+        while i < n and i < pos + max_len:
+            while i < n and text[i] in " \t":
+                i += 1
+            if i < n and text[i] == "+":
+                i += 1
+                while i < n and text[i] in " \t":
+                    i += 1
+                if i < n and text[i] in ("'", '"', "`"):
+                    lit2, end2 = _extract_string_literal_at(text, i)
+                    if lit2:
+                        expr = expr + "+" + lit2
+                        i = end2
+                        continue
+                # identifier or call in the middle of concat (date pieces etc.)
+                m = re.match(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\([^)]*\))*", text[i:i+120])
+                if m:
+                    expr = expr + "+" + m.group(0)
+                    i += len(m.group(0))
+                    continue
+            break
+        return expr, i
+    return None, pos
+
 def _iter_assignments(text):
     for m in ASSIGN_BIND_RE.finditer(text):
         name = m.group(1) or ""
         pos = m.end()
-        lit, end = _extract_string_literal_at(text, pos)
-        if lit:
-            yield name, lit, m.start()
+        expr, end = _extract_rhs_expr(text, pos)
+        if expr:
+            yield name, expr, m.start()
 
 def _iter_bare_strings(text, min_len=12):
     i = 0
@@ -653,6 +717,35 @@ CODE_FRAGMENT_RE = re.compile(
     re.I
 )
 
+# Query-string / route builders (reportId=, moduleId=, &foo=, #/path) are not secrets
+QUERY_STRING_NOISE_RE = re.compile(
+    r"(?:"
+    r"(?:^|[?&#])[A-Za-z_][\w]*="          # param=  or ?param= or &param=
+    r"|[?&][A-Za-z_][\w]*="                # mid-string query params
+    r"|#/[A-Za-z0-9_\-./]+"                # hash routes  #/search-results
+    r"|/(?:ngrx|api|ui|app|admin|portal|search)[/\-]"  # common app path segments
+    r"|(?:viewType|workspaceId|moduleId|reportId|statsGroup|solutio)"  # UI ids
+    r")",
+    re.I
+)
+
+def _looks_like_query_or_route(s):
+    """True for URL/query/route construction, not credential material."""
+    if not s:
+        return False
+    s = s.strip()
+    if QUERY_STRING_NOISE_RE.search(s):
+        return True
+    # Multiple key=value style fragments
+    if s.count("=") >= 2 and ("&" in s or "?" in s or "${" in s):
+        return True
+    # Bare param= anchors left after stripping template interpolations
+    if re.match(r"^[A-Za-z_][\w]*=&?[A-Za-z_]?", s) and len(s) < 80:
+        return True
+    if re.match(r"^&[A-Za-z_][\w]*=", s):
+        return True
+    return False
+
 def _is_noise_value(s):
     if not s:
         return True
@@ -666,6 +759,8 @@ def _is_noise_value(s):
     if PATH_OR_ASSET_RE.search(s):
         return True
     if CODE_FRAGMENT_RE.search(s):
+        return True
+    if _looks_like_query_or_route(s):
         return True
     if s.startswith("/") or s.startswith("./") or s.startswith("../"):
         return True
@@ -707,6 +802,7 @@ def _normalize_expr(expr):
     return e.strip()
 
 def _extract_template_bodies(expr):
+    """Extract template literal bodies, correctly handling nested `${`...`}` templates."""
     out = []
     i = 0
     n = len(expr)
@@ -715,15 +811,51 @@ def _extract_template_bodies(expr):
             i += 1
             start = i
             esc = False
+            brace_depth = 0  # ${ } nesting while inside this template
             while i < n:
                 c = expr[i]
                 if esc:
                     esc = False
-                elif c == "\\":
+                    i += 1
+                    continue
+                if c == "\\":
                     esc = True
-                elif c == "`":
+                    i += 1
+                    continue
+                if brace_depth == 0 and c == "`":
                     out.append(expr[start:i])
                     break
+                if c == "`" and brace_depth > 0:
+                    # nested template inside ${...}: consume until its closing `
+                    i += 1
+                    nest_esc = False
+                    nest_brace = 0
+                    while i < n:
+                        c2 = expr[i]
+                        if nest_esc:
+                            nest_esc = False
+                        elif c2 == "\\":
+                            nest_esc = True
+                        elif nest_brace == 0 and c2 == "`":
+                            break
+                        elif c2 == "$" and i + 1 < n and expr[i + 1] == "{":
+                            nest_brace += 1
+                            i += 1
+                        elif c2 == "{" and nest_brace > 0:
+                            nest_brace += 1
+                        elif c2 == "}" and nest_brace > 0:
+                            nest_brace -= 1
+                        i += 1
+                    i += 1
+                    continue
+                if c == "$" and i + 1 < n and expr[i + 1] == "{":
+                    brace_depth += 1
+                    i += 2
+                    continue
+                if c == "{" and brace_depth > 0:
+                    brace_depth += 1
+                elif c == "}" and brace_depth > 0:
+                    brace_depth -= 1
                 i += 1
         i += 1
     return out
@@ -858,16 +990,51 @@ def _resolve_simple_expr(expr, const_map):
     joined = "".join(out).strip()
     return joined, dynamic, True, ([joined] if joined else [])
 
+def _is_password_like_anchor(a):
+    """
+    Password-style fragment: mixed case + digit + special (e.g. byGo@te7, lightSn!ke327).
+    Distinct from URL/query glue.
+    """
+    a = (a or "").strip()
+    if len(a) < 6 or len(a) > 64:
+        return False
+    if " " in a or "\t" in a:
+        return False
+    if _looks_like_query_or_route(a):
+        return False
+    if re.match(r"^&?[A-Za-z_][\w]*=", a):
+        return False
+    has_l = any(c.islower() for c in a)
+    has_u = any(c.isupper() for c in a)
+    has_d = any(c.isdigit() for c in a)
+    # Prefer real password specials; exclude pure URL glue
+    has_pw_special = any(c in a for c in "@!#$%^*_+-")
+    if not (has_l and has_u and has_d and has_pw_special):
+        return False
+    if _is_noise_value(a):
+        return False
+    return True
+
 def _is_strong_anchor(a):
     a = (a or "").strip()
     if len(a) < 8:
         return False
     if _is_noise_value(a):
         return False
+    if _looks_like_query_or_route(a):
+        return False
+    # Query-param-shaped anchors: reportId=, &moduleId=, key=
+    if re.match(r"^&?[A-Za-z_][\w]*=", a) and not re.search(
+        r"(?:secret|token|password|apikey|api[_-]?key|bearer|jwt|credential)", a, re.I
+    ):
+        return False
     if " " in a or "\t" in a:
         return False
     if a.endswith((".", "!", "?", ":")) and len(a) > 20:
         return False
+    # Password-like fragments always count as strong
+    if _is_password_like_anchor(a):
+        return True
     letter_ratio = sum(1 for c in a if c.isalpha()) / float(len(a))
     if letter_ratio > 0.85 and not any(c in a for c in "@#$%^&*_+=") and not any(c.isdigit() for c in a):
         return False
@@ -875,6 +1042,10 @@ def _is_strong_anchor(a):
         return False
     has_special = any(c in a for c in "@#$%^&*_+=")
     ent = shannon_entropy(a)
+    # Require higher entropy when the only "special" chars are URL glue (= & ?)
+    if re.search(r"[=&?]", a) and not re.search(r"[@#$%^*_+!]", a):
+        if ent < 3.5:
+            return False
     if has_special and ent >= 2.7 and len(a) >= 8:
         return True
     if len(a) >= 20 and ent >= 3.8 and letter_ratio < 0.9:
@@ -891,6 +1062,7 @@ def _score_secret_candidate(name, compact, anchors, expr, dynamic, near_sink, ha
     )
 
     strong_anchors = [a for a in anchors if _is_strong_anchor(a)]
+    pw_anchors = [a for a in anchors if _is_password_like_anchor(a)]
 
     compact_ok = bool(compact) and not _is_noise_value(compact) and (" " not in compact)
     looks_like_prose = bool(compact) and (" " in compact or compact.endswith((".", "!", "?", ":")))
@@ -910,6 +1082,13 @@ def _score_secret_candidate(name, compact, anchors, expr, dynamic, near_sink, ha
     if strong_anchors:
         score += 4
         reasons.append("strong static anchors (%d)" % len(strong_anchors))
+    # Password-like anchors (mixed case + digit + @!#$ etc.)
+    if pw_anchors:
+        score += 2
+        reasons.append("password-like anchors (%d)" % len(pw_anchors))
+        if len(pw_anchors) >= 2:
+            score += 2
+            reasons.append("multi-part password construction")
     if compact_ok and not looks_like_prose and len(compact) >= 16 and _has_mixed_classes(compact) and shannon_entropy(compact) >= 3.8:
         score += 2
         reasons.append("high-entropy mixed body")
@@ -924,6 +1103,194 @@ def _score_secret_candidate(name, compact, anchors, expr, dynamic, near_sink, ha
         reasons.append("dynamic composition")
 
     return score, reasons, has_known_shape, strong_anchors
+
+# Fallback: password-like static chunks around ${...} or + date glue inside templates
+_PW_CHUNK_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9@!#$%^*_+\-]{5,31})"
+)
+_NESTED_OR_DATE_TMPL_RE = re.compile(
+    r"`([^`]{0,40})\$\{[^`]{0,200}\}([^`]{0,40})`",
+    re.S
+)
+
+
+def _consume_js_interpolation(text, dollar_idx):
+    """Return index after the matching } for a ${...} expression.
+
+    Handles nested braces plus quoted strings and nested template literals.
+    Jython 2.7 compatible and intentionally independent of a full JS parser.
+    """
+    n = len(text)
+    if dollar_idx < 0 or dollar_idx + 1 >= n or text[dollar_idx:dollar_idx + 2] != "${":
+        return -1
+
+    def skip_quoted(pos, quote):
+        pos += 1
+        escaped = False
+        while pos < n:
+            ch = text[pos]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                return pos + 1
+            pos += 1
+        return n
+
+    def skip_template(pos):
+        # pos points at the opening backtick
+        pos += 1
+        escaped = False
+        while pos < n:
+            ch = text[pos]
+            if escaped:
+                escaped = False
+                pos += 1
+                continue
+            if ch == "\\":
+                escaped = True
+                pos += 1
+                continue
+            if ch == "`":
+                return pos + 1
+            if ch == "$" and pos + 1 < n and text[pos + 1] == "{":
+                end = consume_braces(pos)
+                if end < 0:
+                    return n
+                pos = end
+                continue
+            pos += 1
+        return n
+
+    def consume_braces(pos):
+        # pos points at '$' in '${'
+        depth = 1
+        pos += 2
+        while pos < n:
+            ch = text[pos]
+            if ch in ("'", '"'):
+                pos = skip_quoted(pos, ch)
+                continue
+            if ch == "`":
+                pos = skip_template(pos)
+                continue
+            if ch == "/" and pos + 1 < n and text[pos + 1] == "/":
+                nl = text.find("\n", pos + 2)
+                pos = n if nl < 0 else nl + 1
+                continue
+            if ch == "/" and pos + 1 < n and text[pos + 1] == "*":
+                end_comment = text.find("*/", pos + 2)
+                pos = n if end_comment < 0 else end_comment + 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return pos + 1
+            pos += 1
+        return -1
+
+    return consume_braces(dollar_idx)
+
+
+def _find_balanced_password_templates(js_text):
+    """Find password-like static chunks surrounding a balanced ${...}.
+
+    This catches outer templates containing nested templates, such as:
+      `prefix${`${year}${month}${day}`}suffix`
+    """
+    out = []
+    if not js_text:
+        return out
+
+    # Require mixed password-style left/right chunks immediately around ${...}.
+    left_re = re.compile(r"([A-Za-z][A-Za-z0-9@!#$%^&*_+\-]{5,47})$")
+    right_re = re.compile(r"^([A-Za-z][A-Za-z0-9@!#$%^&*_+\-]{5,47})")
+    i = 0
+    n = len(js_text)
+    while True:
+        dollar = js_text.find("${", i)
+        if dollar < 0:
+            break
+
+        left_window = js_text[max(0, dollar - 64):dollar]
+        lm = left_re.search(left_window)
+        if not lm:
+            i = dollar + 2
+            continue
+
+        end = _consume_js_interpolation(js_text, dollar)
+        if end < 0 or end > n:
+            i = dollar + 2
+            continue
+
+        rm = right_re.match(js_text[end:min(n, end + 64)])
+        if not rm:
+            i = dollar + 2
+            continue
+
+        left = lm.group(1)
+        right = rm.group(1)
+        if not (_is_password_like_anchor(left) and _is_password_like_anchor(right)):
+            i = dollar + 2
+            continue
+
+        start = dollar - len(left)
+        # Prefer to include the surrounding quote/backtick in the match.
+        if start > 0 and js_text[start - 1] in ("'", '"', "`"):
+            start -= 1
+        match_end = end + len(right)
+        if match_end < n and js_text[match_end] in ("'", '"', "`"):
+            match_end += 1
+
+        out.append({
+            "expr": js_text[start:match_end],
+            "start_idx": start,
+            "anchors": [left, right],
+            "pw": [left, right],
+        })
+        i = match_end if match_end > dollar else dollar + 2
+
+    return out
+
+def _find_password_template_fallback(js_text):
+    """
+    Direct scan for templates that sandwich date/dynamic ${} between two
+    password-like static chunks (handles nested templates the main path misses).
+    """
+    out = []
+    if not js_text:
+        return out
+    # Normalize nested templates by treating inner ` as opaque for a coarse pass
+    # Match outer template-like regions containing ${ and two pw-like chunks
+    i = 0
+    n = len(js_text)
+    while i < n:
+        if js_text[i] != "`":
+            i += 1
+            continue
+        lit, end = _extract_string_literal_at(js_text, i)
+        if not lit or "${" not in lit:
+            i = i + 1 if end <= i else end
+            continue
+        # Static anchors from the template body
+        try:
+            body = lit[1:-1] if len(lit) >= 2 else lit
+            anchors = _template_static_anchors(body)
+        except Exception:
+            anchors = []
+        pw = [a for a in anchors if _is_password_like_anchor(a)]
+        if len(pw) >= 2:
+            out.append({
+                "expr": lit,
+                "start_idx": i,
+                "anchors": anchors,
+                "pw": pw,
+            })
+        i = end if end > i else i + 1
+    return out
 
 def scan_generic_secrets(js_text):
     findings = []
@@ -955,14 +1322,19 @@ def scan_generic_secrets(js_text):
             name, compact, anchors, expr, dynamic, near_sink, has_sensitive_name
         )
 
+        pw_anchor_count = sum(1 for a in anchors if _is_password_like_anchor(a))
+
         if has_known_shape:
             min_score = 6
         elif has_sensitive_name and (strong_anchors or near_sink):
+            min_score = 8
+        elif pw_anchor_count >= 2 and dynamic:
+            # Multi-part password construction: byGo@te7 + date + lightSn!ke327
             min_score = 7
         elif strong_anchors and dynamic:
-            min_score = 7
+            min_score = 8
         else:
-            min_score = 12
+            min_score = 13
 
         if score < min_score:
             continue
@@ -1025,7 +1397,9 @@ def scan_generic_secrets(js_text):
             or KNOWN_TOKEN_SHAPE_RE.search(expr or "") is not None
             or any(KNOWN_TOKEN_SHAPE_RE.search(a or "") for a in anchors)
         )
-        if not has_known_shape:
+        pw_anchor_count = sum(1 for a in anchors if _is_password_like_anchor(a))
+        # Bare literals: known shapes OR multi-part password-like template construction
+        if not has_known_shape and not (pw_anchor_count >= 2 and dynamic):
             continue
 
         near_sink = AUTH_SINK_RE.search(
@@ -1035,12 +1409,36 @@ def scan_generic_secrets(js_text):
         score, reasons, has_known_shape, strong_anchors = _score_secret_candidate(
             "", compact, anchors, expr, dynamic, near_sink, False
         )
-        if not has_known_shape:
+        if not has_known_shape and pw_anchor_count < 2:
+            continue
+        if not has_known_shape and score < 7:
             continue
 
-        rid = "JS-SECRET-BARE-001"
-        sev = "critical"
-        conf = "medium"
+        if has_known_shape:
+            rid = "JS-SECRET-BARE-001"
+            sev = "critical"
+            conf = "medium"
+            title = "Bare secret/token-like literal (known shape)"
+            detail = (
+                "Known token shape in a string/template literal. Signals: %s. "
+                "length=%d entropy~=%.2f"
+            ) % (
+                ", ".join(reasons) or "known shape",
+                len(compact),
+                shannon_entropy(compact) if compact else 0.0,
+            )
+        else:
+            rid = "JS-SECRET-BARE-002"
+            sev = "high"
+            conf = "medium"
+            title = "Bare multi-part password-like template"
+            detail = (
+                "Template literal with multiple password-like static anchors "
+                "(mixed case + digit + special). Signals: %s. Anchors=%s"
+            ) % (
+                ", ".join(reasons) or "password-like anchors",
+                [a[:40] for a in anchors if _is_password_like_anchor(a)],
+            )
 
         preview = compact[:48] if compact else raw[:40]
         key = "%s|%s|%s" % (rid, line, preview)
@@ -1050,17 +1448,10 @@ def scan_generic_secrets(js_text):
 
         findings.append({
             "rule_id": rid,
-            "title": "Bare secret/token-like literal (known shape)",
+            "title": title,
             "severity": sev,
             "confidence": conf,
-            "detail": (
-                "Known token shape in a string/template literal. Signals: %s. "
-                "length=%d entropy~=%.2f"
-            ) % (
-                ", ".join(reasons) or "known shape",
-                len(compact),
-                shannon_entropy(compact) if compact else 0.0,
-            ),
+            "detail": detail,
             "fix": (
                 "Review whether this is a live credential or API key. "
                 "If yes: rotate and remove from client code."
@@ -1069,6 +1460,62 @@ def scan_generic_secrets(js_text):
             "line": line,
             "match": raw[:240],
             "snippet": _snippet(js_text, start_idx)[:480],
+        })
+
+    # Fallback: nested/date-stitched password templates the assignment path may miss
+    for hit in _find_password_template_fallback(js_text):
+        line = _line_number(js_text, hit["start_idx"])
+        preview = (hit["pw"][0][:24] + "..." + hit["pw"][1][:24]) if len(hit["pw"]) >= 2 else hit["expr"][:48]
+        key = "JS-SECRET-PW-TMPL|%s|%s" % (line, preview)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append({
+            "rule_id": "JS-SECRET-PW-TMPL-001",
+            "title": "Date/dynamic-stitched password-like template",
+            "severity": "high",
+            "confidence": "medium",
+            "detail": (
+                "Template literal builds a credential-like value from multiple "
+                "password-style static anchors with dynamic ${...} glue (often a date). "
+                "Anchors=%s"
+            ) % [a[:40] for a in hit["pw"]],
+            "fix": (
+                "Treat as a potentially hard-coded password pattern. Confirm, rotate if live, "
+                "and move secret construction server-side."
+            ),
+            "category": "secrets",
+            "line": line,
+            "match": hit["expr"][:240],
+            "snippet": _snippet(js_text, hit["start_idx"])[:480],
+        })
+
+    # Balanced fallback for nested template literals that defeat literal extraction.
+    for hit in _find_balanced_password_templates(js_text):
+        line = _line_number(js_text, hit["start_idx"])
+        preview = hit["pw"][0][:24] + "..." + hit["pw"][1][:24]
+        key = "JS-SECRET-GEN-002|%s|%s" % (line, preview)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append({
+            "rule_id": "JS-SECRET-GEN-002",
+            "title": "Secret/token candidate (nested dynamic template)",
+            "severity": "high",
+            "confidence": "medium",
+            "detail": (
+                "Balanced template scan found password-like static prefixes and suffixes "
+                "around a dynamic ${...} expression, including nested template literals. "
+                "Anchors=%s"
+            ) % [a[:40] for a in hit["pw"]],
+            "fix": (
+                "Treat as a potentially hard-coded credential pattern. Confirm, rotate if live, "
+                "remove it from client code, and construct secrets server-side."
+            ),
+            "category": "secrets",
+            "line": line,
+            "match": hit["expr"][:240],
+            "snippet": _snippet(js_text, hit["start_idx"])[:480],
         })
 
     return findings
@@ -1104,26 +1551,35 @@ def scan_source_sink_heuristic(js_text):
         line = _line_number(js_text, sidx)
         if line in seen_lines:
             continue
-        window = js_text[sidx:min(len(js_text), sidx + 450)]
-        if SINK_RE.search(window) and not SANITIZER_RE.search(window):
-            seen_lines.add(line)
-            findings.append({
-                "rule_id": "JS-TAINT-001",
-                "title": "Potential source->sink DOM / code injection flow",
-                "severity": "high",
-                "confidence": "low",
-                "detail": ("Possible flow from URL/cookie/referrer/window.name source into a "
-                           "DOM HTML sink, location assignment, or dynamic code execution "
-                           "without a visible sanitizer in the nearby window. "
-                           "Manual confirmation required. Use Burp DOM Invader to test."),
-                "fix": ("Sanitize or validate the source. Prefer safe DOM APIs (textContent). "
-                          "For navigation sinks, allowlist destinations. "
-                          "Reproduce with DOM Invader (Sources -> canary -> observe sinks)."),
-                "category": "xss",
-                "line": line,
-                "match": window[:220],
-                "snippet": _snippet(js_text, sidx)[:450],
-            })
+        # Smaller window + require same-function-ish proximity
+        window = js_text[sidx:min(len(js_text), sidx + 280)]
+        if SANITIZER_RE.search(window):
+            continue
+        sink_m = SINK_RE.search(window)
+        if not sink_m:
+            continue
+        # Reject if a function boundary appears between source and sink
+        between = window[:sink_m.start()]
+        if re.search(r"\bfunction\b|=>\s*\{", between):
+            continue
+        seen_lines.add(line)
+        findings.append({
+            "rule_id": "JS-TAINT-001",
+            "title": "Potential source->sink DOM / code injection flow",
+            "severity": "medium",
+            "confidence": "low",
+            "detail": ("Possible flow from URL/cookie/referrer/window.name source into a "
+                       "DOM HTML sink, location assignment, or dynamic code execution "
+                       "without a visible sanitizer in the nearby window. "
+                       "Manual confirmation required. Use Burp DOM Invader to test."),
+            "fix": ("Sanitize or validate the source. Prefer safe DOM APIs (textContent). "
+                      "For navigation sinks, allowlist destinations. "
+                      "Reproduce with DOM Invader (Sources -> canary -> observe sinks)."),
+            "category": "xss",
+            "line": line,
+            "match": window[:220],
+            "snippet": _snippet(js_text, sidx)[:450],
+        })
     return findings
 
 # ---------------------------------------------------------------------------
@@ -1161,14 +1617,67 @@ HTML_JS_URL_ATTR_RE = re.compile(
 JS_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_$][\w$]{0,80}\b")
 
 
+# ---------------------------------------------------------------------------
+# Stronger context-aware FP gate + scoring verifier
+# ---------------------------------------------------------------------------
+
+# Benign patterns we almost never want as High/Medium
+BENIGN_JS_URL_RE = re.compile(
+    r"javascript\s*:\s*(?:void\s*\(\s*0?\s*\)\s*;?|;|false|true|undefined|null)\b",
+    re.I
+)
+BENIGN_EVAL_RE = re.compile(
+    r"(?:JSON\.parse|JSON\.stringify|parseInt|parseFloat|Number|String|Boolean|"
+    r"decodeURIComponent|encodeURIComponent|atob|btoa)\s*\(",
+    re.I
+)
+BENIGN_INNERHTML_RE = re.compile(
+    r"(?:textContent|innerText)\s*=|"
+    r"DOMPurify\.sanitize|sanitizeHtml|trustedTypes|"
+    r"createTextNode|\.text\s*\(",
+    re.I
+)
+BENIGN_LOCATION_RE = re.compile(
+    r"(?:location\.(?:protocol|host|hostname|port|pathname|origin)\b|"
+    r"window\.location\.(?:protocol|host|hostname|port|pathname|origin)\b)",
+    re.I
+)
+PLACEHOLDER_OR_TEST_RE = re.compile(
+    r"(?:example|sample|test|demo|changeme|your[_-]?key|token[_-]?here|"
+    r"placeholder|xxx+|todo|fixme|lorem|ipsum|foo|bar|baz|"
+    r"null|undefined|true|false|0|1)\b",
+    re.I
+)
+MINIFIED_NOISE_RE = re.compile(
+    r"(?:webpackJsonp|__esModule|function\s*\(\s*\)\s*\{|\"use strict\")",
+    re.I
+)
+
+def _window_around(text, idx, before=180, after=280):
+    if not text:
+        return ""
+    start = max(0, idx - before)
+    end = min(len(text), idx + after)
+    return text[start:end]
+
+def _line_text(text, line_no):
+    try:
+        lines = text.splitlines()
+        if 1 <= line_no <= len(lines):
+            return lines[line_no - 1]
+    except Exception:
+        pass
+    return ""
+
 class ContextualAnalyzer(object):
     def __init__(self, text, kind):
         self.text = text or ""
         self.kind = kind  # "js" or "html"
-        self.lines = self.text.splitlines()
         self.tainted = set()
-        self.assignments = []   # list of dict: {name, expr, idx, line}
-        self.url_sinks = []     # list of dict: {expr, idx, line, raw}
+        self.assignments = []
+        self.url_sinks = []
+        self.html_sinks = []
+        self.eval_sites = []
         self._build_state()
 
     def _line(self, idx):
@@ -1178,7 +1687,6 @@ class ContextualAnalyzer(object):
         if self.kind != "js" or not self.text:
             return
 
-        # 1) collect assignments
         for m in JS_ASSIGN_RE.finditer(self.text):
             name = m.group(1) or ""
             expr = (m.group(2) or "").strip()
@@ -1189,17 +1697,13 @@ class ContextualAnalyzer(object):
                 "line": self._line(m.start()),
             })
 
-        # 2) seed taint from direct source expressions
-        changed = True
         for a in self.assignments:
             if JS_SOURCE_EXPR_RE.search(a["expr"]):
                 self.tainted.add(a["name"])
 
-        # 3) iterate propagation through identifiers
-        # lightweight fixed-point
-        max_rounds = 6
+        changed = True
         rounds = 0
-        while changed and rounds < max_rounds:
+        while changed and rounds < 6:
             changed = False
             rounds += 1
             for a in self.assignments:
@@ -1210,13 +1714,9 @@ class ContextualAnalyzer(object):
                     self.tainted.add(a["name"])
                     changed = True
 
-        # 4) collect URL-like sinks with RHS expression window
         for m in JS_URL_SINK_RE.finditer(self.text):
             idx = m.start()
-            line = self._line(idx)
             window = self.text[idx:min(len(self.text), idx + 420)]
-
-            # heuristic extraction of RHS for "= ..." or arg for setAttribute
             expr = window
             eq_pos = window.find("=")
             if eq_pos != -1:
@@ -1225,12 +1725,37 @@ class ContextualAnalyzer(object):
                 comma = window.find(",")
                 if comma != -1:
                     expr = window[comma + 1:comma + 220]
-
             self.url_sinks.append({
                 "expr": expr.strip(),
                 "idx": idx,
-                "line": line,
+                "line": self._line(idx),
                 "raw": window[:260],
+            })
+
+        # HTML / code-exec sinks for local gating
+        html_sink_re = re.compile(
+            r"(?:\.innerHTML\s*=|\.outerHTML\s*=|insertAdjacentHTML\s*\(|"
+            r"document\.write(?:ln)?\s*\(|\.srcdoc\s*=|"
+            r"dangerouslySetInnerHTML)",
+            re.I
+        )
+        for m in html_sink_re.finditer(self.text):
+            self.html_sinks.append({
+                "idx": m.start(),
+                "line": self._line(m.start()),
+                "raw": _window_around(self.text, m.start(), 80, 200),
+            })
+
+        eval_re = re.compile(
+            r"\b(?:eval\s*\(|new\s+Function\s*\(|setTimeout\s*\(\s*['\"`]|"
+            r"setInterval\s*\(\s*['\"`])",
+            re.I
+        )
+        for m in eval_re.finditer(self.text):
+            self.eval_sites.append({
+                "idx": m.start(),
+                "line": self._line(m.start()),
+                "raw": _window_around(self.text, m.start(), 60, 180),
             })
 
     def _expr_is_tainted(self, expr):
@@ -1239,123 +1764,220 @@ class ContextualAnalyzer(object):
         if JS_SOURCE_EXPR_RE.search(expr):
             return True
         ids = set(JS_IDENTIFIER_RE.findall(expr))
-        if ids.intersection(self.tainted):
-            return True
-        return False
+        return bool(ids.intersection(self.tainted))
 
-    def _find_nearby_url_sink(self, line, radius=4):
-        for s in self.url_sinks:
+    def _find_nearby(self, sinks, line, radius=5):
+        for s in sinks:
             if abs((s.get("line") or 0) - (line or 0)) <= radius:
                 return s
         return None
 
     def validate(self, finding):
+        """Return finding (possibly severity-adjusted) or None to suppress."""
         rid = finding.get("rule_id", "")
         line = finding.get("line", 0)
         match = finding.get("match", "") or ""
         snippet = finding.get("snippet", "") or ""
+        blob = (match + " " + snippet).lower()
 
-        # --- JS-URL-JS-001 ---
-        if rid == "JS-URL-JS-001":
-            if self.kind != "js":
-                return None
-
-            sink = self._find_nearby_url_sink(line, radius=5)
-
-            # If not tied to actual navigation/resource sink -> suppress
-            if not sink:
-                return None
-
-            expr = (sink.get("expr") or "") + " " + match + " " + snippet
-            tainted = self._expr_is_tainted(expr)
-
-            # static javascript:void(0) etc. without taint => informational hygiene
-            if not tainted:
-                lowered = expr.lower()
-                if "javascript:void(0" in lowered or "javascript:;" in lowered:
+        # ---- javascript: URLs ----
+        if rid in ("JS-URL-JS-001", "HTML-JS-URL-001"):
+            if BENIGN_JS_URL_RE.search(blob):
+                return None  # void(0) / ; / false etc.
+            if rid == "JS-URL-JS-001":
+                if self.kind != "js":
+                    return None
+                sink = self._find_nearby(self.url_sinks, line, radius=5)
+                if not sink:
+                    return None
+                expr = (sink.get("expr") or "") + " " + match
+                if not self._expr_is_tainted(expr):
+                    # static scheme only → hygiene
                     finding["severity"] = "info"
                     finding["confidence"] = "medium"
                     finding["detail"] = (
-                        "javascript: scheme assigned to URL sink, but no user-controlled "
-                        "data flow detected nearby. Treat as hygiene/CSP concern unless "
-                        "runtime data binding changes this."
+                        "javascript: scheme on a URL sink with no clear "
+                        "user-controlled data flow. CSP/hygiene concern."
                     )
                     return finding
-                return None
-
-            finding["severity"] = "high"
-            finding["confidence"] = "high"
-            finding["detail"] = (
-                "Potential user-controlled flow into javascript: URL sink. "
-                "Source/propagation evidence suggests attacker influence. "
-                "Validate exploitability with DOM Invader."
-            )
-            return finding
-
-        # --- HTML-JS-URL-001 ---
-        if rid == "HTML-JS-URL-001":
-            if self.kind != "html":
+                finding["severity"] = "high"
+                finding["confidence"] = "high"
                 return finding
-
-            blob = (match + " " + snippet).lower()
-
-            # Suppress common no-op javascript anchors
-            if re.search(r"javascript\s*:\s*(?:void\s*\(\s*0\s*\)\s*;?|;)\b", blob, re.I):
-                return None
-
-            # Determine if this is likely static attribute vs dynamic tainted composition
-            # For raw HTML response scanning, mostly static; downgrade unless dynamic markers
-            blob = (match + " " + snippet).lower()
-            dynamic_markers = ("${", "{{", "<%=", "concat(", "+")
-            has_dynamic_marker = any(dm in blob for dm in dynamic_markers)
-
-            if has_dynamic_marker:
+            # HTML attribute
+            dynamic_markers = ("${", "{{", "<%=", "concat(", "+ location", "+ search", "+ hash")
+            if any(dm in blob for dm in dynamic_markers):
                 finding["severity"] = "medium"
                 finding["confidence"] = "medium"
-                finding["detail"] = (
-                    "javascript: URL found with dynamic composition markers. "
-                    "Potentially exploitable if attacker controls injected segment."
-                )
                 return finding
-
-            # Static literal in HTML should be low/info, not high vulnerability by default
             finding["severity"] = "low"
             finding["confidence"] = "high"
             finding["detail"] = (
-                "Static javascript: URL attribute found. Usually a security hygiene / CSP "
-                "issue unless user-controlled data can influence the attribute at runtime."
+                "Static javascript: attribute. Hygiene/CSP issue unless "
+                "runtime data can influence it."
             )
             return finding
 
-        # --- JS-DOM-XSS-004 (href/src/action/location assignments) ---
+        # ---- location / href / src / action ----
         if rid == "JS-DOM-XSS-004":
             if self.kind != "js":
                 return None
-            sink = self._find_nearby_url_sink(line, radius=5)
-            if not sink:
+            if BENIGN_LOCATION_RE.search(blob) and not re.search(
+                r"(?:href|assign|replace)\s*[=\(]", blob, re.I
+            ):
                 return None
+            sink = self._find_nearby(self.url_sinks, line, radius=5)
+            if not sink:
+                finding["severity"] = "low"
+                finding["confidence"] = "low"
+                return finding
             expr = (sink.get("expr") or "") + " " + snippet
-            tainted = self._expr_is_tainted(expr)
-
-            if not tainted:
-                # keep as weaker signal, not medium-by-default
+            if not self._expr_is_tainted(expr):
                 finding["severity"] = "low"
                 finding["confidence"] = "low"
                 finding["detail"] = (
-                    "URL/resource sink assignment found without clear user-controlled source "
-                    "flow in local context."
+                    "URL/resource sink without clear user-controlled source nearby."
                 )
                 return finding
-
             finding["severity"] = "medium"
             finding["confidence"] = "medium"
-            finding["detail"] = (
-                "Potential user-controlled flow into navigation/resource sink. "
-                "Validate allowlisting and scheme restrictions."
-            )
             return finding
 
-        # default: keep existing finding
+        # ---- innerHTML / outerHTML / write / srcdoc / framework sinks ----
+        if rid in ("JS-DOM-XSS-001", "JS-DOM-XSS-002", "JS-DOM-XSS-003",
+                   "JS-REACT-001", "JS-VUE-001", "JS-ANGULAR-001"):
+            if BENIGN_INNERHTML_RE.search(blob):
+                finding["severity"] = "info"
+                finding["confidence"] = "low"
+                finding["detail"] = (
+                    "HTML sink near a sanitizer or safe text API. "
+                    "Confirm the sanitizer covers the data path."
+                )
+                return finding
+            # jQuery static literal: $().html("fixed") with no interpolation
+            if rid == "JS-DOM-XSS-003":
+                if re.search(
+                    r"\.(?:html|append|prepend|after|before|replaceWith)\s*\(\s*['\"][^'\"]*['\"]\s*\)",
+                    blob
+                ):
+                    if not JS_SOURCE_EXPR_RE.search(blob) and "${" not in blob and "+" not in match:
+                        return None
+            lt = _line_text(self.text, line)
+            idx = 0
+            try:
+                if match:
+                    pos = self.text.find(match[:40]) if len(match) >= 4 else -1
+                    if pos >= 0:
+                        idx = pos
+            except Exception:
+                idx = 0
+            nearby = _window_around(self.text, max(0, idx), 220, 320)
+            has_source = bool(
+                JS_SOURCE_EXPR_RE.search(nearby)
+                or JS_SOURCE_EXPR_RE.search(lt)
+                or JS_SOURCE_EXPR_RE.search(snippet)
+            )
+            has_taint = False
+            if self.tainted:
+                for n in self.tainted:
+                    if n and (n in nearby or n in lt or n in snippet):
+                        has_taint = True
+                        break
+            if not has_source and not has_taint:
+                finding["severity"] = "info"
+                finding["confidence"] = "low"
+                finding["detail"] = (
+                    "DOM HTML sink without clear nearby source/taint. "
+                    "Manual review; many frameworks use these safely."
+                )
+                return finding
+            return finding
+
+        # ---- eval / Function / setTimeout(string) ----
+        if rid in ("JS-EVAL-001", "JS-EVAL-002"):
+            if BENIGN_EVAL_RE.search(blob):
+                return None
+            nearby = snippet + " " + match
+            if self._expr_is_tainted(nearby) or JS_SOURCE_EXPR_RE.search(nearby):
+                finding["severity"] = "high"
+                finding["confidence"] = "medium"
+                return finding
+            # static string eval is still interesting but lower
+            if re.search(r"eval\s*\(\s*['\"`]", nearby) or re.search(
+                r"new\s+Function\s*\(\s*['\"`]", nearby
+            ):
+                finding["severity"] = "medium"
+                finding["confidence"] = "low"
+                finding["detail"] = (
+                    "Dynamic code execution with apparent static/literal argument. "
+                    "Confirm no data reaches the callee at runtime."
+                )
+                return finding
+            finding["severity"] = "low"
+            finding["confidence"] = "low"
+            return finding
+
+        # ---- postMessage ----
+        if rid == "JS-POSTMSG-001":
+            # wildcard targetOrigin is real signal; keep
+            return finding
+        if rid == "JS-POSTMSG-002":
+            lt = _line_text(self.text, line)
+            blob2 = (blob + " " + lt).lower()
+            if not re.search(r"(?:event|message|e|msg|m)\.data", blob2):
+                finding["severity"] = "info"
+                finding["confidence"] = "low"
+                return finding
+            if re.search(r"(?:event|e|msg|m)\.origin\s*(?:===|==|!==|!=)", blob2):
+                return None
+            return finding
+
+        # ---- storage / cookie ----
+        if rid == "JS-STORAGE-001":
+            if PLACEHOLDER_OR_TEST_RE.search(blob):
+                return None
+            return finding
+        if rid == "JS-COOKIE-001":
+            # document.cookie = is common; only keep if looks session-like
+            if re.search(r"(?:session|token|auth|jwt|sid|ssid)=", blob, re.I):
+                return finding
+            finding["severity"] = "info"
+            finding["confidence"] = "low"
+            return finding
+
+        # ---- Math.random / weak crypto ----
+        if rid == "JS-RAND-001":
+            # only interesting near token/key/nonce/id generation
+            if re.search(r"(?:token|nonce|secret|key|password|session|csrf|id)\s*[=:]", blob, re.I):
+                return finding
+            return None  # pure Math.random() noise
+        if rid in ("JS-CRYPTO-WEAK-HASH-001", "JS-CRYPTO-WEAK-CIPHER-001"):
+            # word boundary already there; still suppress comments / library names
+            if re.search(r"(?://|/\*|\*|#).*?(?:md5|sha1|des|rc4)", blob):
+                return None
+            if re.search(r"(?:checksum|etag|hashCode|content[_-]?hash)", blob, re.I):
+                finding["severity"] = "info"
+                finding["confidence"] = "low"
+                return finding
+            return finding
+
+        # ---- open redirect heuristic ----
+        if rid == "JS-OPEN-REDIRECT-001":
+            if self._expr_is_tainted(snippet) or JS_SOURCE_EXPR_RE.search(snippet):
+                return finding
+            finding["severity"] = "low"
+            finding["confidence"] = "low"
+            return finding
+
+        # ---- inline event handlers (HTML) ----
+        if rid == "HTML-EVENT-001":
+            # suppress empty / trivial handlers
+            if re.search(r"=\s*['\"]\s*['\"]", match) or re.search(
+                r"=\s*['\"](?:return\s+)?(?:false|true|;)\s*['\"]", match, re.I
+            ):
+                return None
+            return finding
+
+        # default keep
         return finding
 
     def run(self, findings):
@@ -1366,10 +1988,110 @@ class ContextualAnalyzer(object):
                 if vf is not None:
                     out.append(vf)
             except Exception:
-                # fail-open for non-target rules
                 out.append(f)
         return out
 
+# ---------------------------------------------------------------------------
+# Unified score-based verifier (call after ContextualAnalyzer)
+# ---------------------------------------------------------------------------
+
+def verify_finding(finding, js_or_html_text, kind="js"):
+    """
+    Returns (keep: bool, finding_dict).
+    Score:
+      0-1 suppress
+      2 info/low
+      3 medium
+      4 high / critical (unchanged if already critical with known shape)
+    """
+    f = dict(finding)
+    rid = f.get("rule_id", "")
+    sev = f.get("severity", "medium")
+    conf = f.get("confidence", "medium")
+    match = f.get("match", "") or ""
+    snippet = f.get("snippet", "") or ""
+    blob = (match + " " + snippet)
+
+    score = 2  # baseline for a regex hit that survived contextual gate
+    reasons = []
+
+    # Known high-value shapes / critical rules start higher
+    if rid.startswith("JS-SECRET-") or rid.startswith("JS-SECRET-BARE") or rid.startswith("JS-SECRET-GEN"):
+        if "known" in (f.get("detail") or "").lower() or "known token shape" in (f.get("detail") or "").lower():
+            score = 4
+            reasons.append("known token shape")
+        else:
+            score = 3
+            reasons.append("secret heuristic")
+    elif sev == "critical":
+        score = 4
+    elif sev == "high":
+        score = 3
+    elif sev == "medium":
+        score = 2
+    else:
+        score = 1
+
+    # Boost if taint-ish
+    if JS_SOURCE_EXPR_RE.search(blob):
+        score += 1
+        reasons.append("source expression nearby")
+    if re.search(r"(?:event|message)\.data", blob, re.I):
+        score += 1
+        reasons.append("message data")
+
+    # Penalize minified / library noise
+    if MINIFIED_NOISE_RE.search(blob):
+        score -= 1
+        reasons.append("minified/library noise")
+    # Placeholder checks for secret findings must inspect the actual matched
+    # candidate, not the surrounding minified snippet. Nearby application code
+    # commonly contains words such as false/null/undefined and previously caused
+    # real credentials to be silently suppressed.
+    placeholder_subject = match if "SECRET" in rid else blob
+    strong_dynamic_secret = (
+        rid in ("JS-SECRET-GEN-002", "JS-SECRET-PW-TMPL-001")
+        and re.search(r"\$\{", match or "")
+        and re.search(r"[A-Z]", match or "")
+        and re.search(r"[a-z]", match or "")
+        and re.search(r"\d", match or "")
+        and re.search(r"[^A-Za-z0-9\s]", match or "")
+    )
+    if (not strong_dynamic_secret) and PLACEHOLDER_OR_TEST_RE.search(placeholder_subject) and "SECRET" in rid:
+        score -= 2
+        reasons.append("placeholder-like")
+
+    # Cap
+    if score < 0:
+        score = 0
+    if score > 4:
+        score = 4
+
+    # For noisy categories, require stronger signal (score >= 3) before reporting
+    cat = f.get("category", "")
+    if score <= 1:
+        return False, f
+    if score == 2 and cat in ("xss", "html-xss", "code-execution", "crypto", "storage"):
+        # Keep secrets / postmessage / framework / redirect at score 2
+        return False, f
+
+    if score == 2:
+        f["severity"] = "info" if sev in ("low", "info") else "low"
+        f["confidence"] = "low"
+    elif score == 3:
+        if sev in ("info", "low"):
+            f["severity"] = "medium"
+        if conf == "low":
+            f["confidence"] = "medium"
+    else:  # 4
+        if sev not in ("critical", "high"):
+            f["severity"] = "high"
+        if conf != "high":
+            f["confidence"] = "medium"
+
+    if reasons:
+        f["detail"] = (f.get("detail") or "") + " [verifier: %s]" % ", ".join(reasons)
+    return True, f
 
 # ---------------------------------------------------------------------------
 # SQL false-positive gate
@@ -1428,6 +2150,16 @@ class ScanCache(object):
         if key in self.store:
             self.store.pop(key, None)
         self.store[key] = time.time()
+
+    def clear(self):
+        """Clear all response, fragment, and Semgrep deduplication entries."""
+        count = len(self.store)
+        self.store.clear()
+        return count
+
+    def size(self):
+        self._evict()
+        return len(self.store)
 
 def _sha256_text(s):
     if s is None:
@@ -1887,7 +2619,9 @@ class SeverityPanel(JPanel):
         self.add(JLabel(" "))
         helper_row = JPanel()
         self.btn_copy_dom_invader = JButton("Copy DOM Invader test checklist")
+        self.btn_clear_cache = JButton("Clear scan cache")
         helper_row.add(self.btn_copy_dom_invader)
+        helper_row.add(self.btn_clear_cache)
         self.add(helper_row)
 
         self.add(JLabel(" "))
@@ -1946,10 +2680,22 @@ class SeverityPanel(JPanel):
                     except Exception as ex:
                         self.append_log("Clipboard copy failed: %s" % ex)
 
+            class ClearCacheAL(ActionListener):
+                def actionPerformed(self2, e):
+                    try:
+                        count = self.extender.clear_scan_cache()
+                        self.append_log(
+                            "Scan cache cleared (%d entries). Re-send the request or use the context-menu manual scan."
+                            % count
+                        )
+                    except Exception as ex:
+                        self.append_log("Cache clear failed: %s" % ex)
+
             btn_all.addActionListener(AllAL())
             btn_def.addActionListener(DefAL())
             self.btn_test_semgrep.addActionListener(TestSemgrepAL())
             self.btn_copy_dom_invader.addActionListener(CopyDomInvaderAL())
+            self.btn_clear_cache.addActionListener(ClearCacheAL())
 
         SwingUtilities.invokeLater(wire)
 
@@ -2084,10 +2830,24 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
         self._semgrep_inflight = 0
         self._semgrep_queue = []
         self._semgrep_lock = __import__("threading").Lock()
+        # Passive scan worker pool — never block the Burp HTTP listener thread
+        self._passive_inflight = 0
+        self._passive_queue = []
+        self._passive_lock = __import__("threading").Lock()
+        self._passive_max_workers = 2
+        self._passive_queue_max = 64
 
         self._stdout.println("[%s] loaded - %d rules" % (EXTENSION_NAME, len(RULES)))
         self.ui.append_log("Loaded. Windows-safe path checks enabled. Cache + DOM Invader guidance active.")
         self.ui.append_log("In-scope filtering fix active: callbacks.isInScope(URL)")
+        self.ui.append_log("Passive scans run async (max %d workers) — will not delay proxy traffic." % self._passive_max_workers)
+
+    def clear_scan_cache(self):
+        """Clear all deduplication caches used by passive and Semgrep scans."""
+        cache = getattr(self, "_scan_cache", None)
+        if cache is None:
+            return 0
+        return cache.clear()
 
     def getTabCaption(self):
         return "JS Audit"
@@ -2272,28 +3032,47 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
         if not code:
             return findings
 
-        base = analyze_text(code, "js_only")
-        sec = scan_generic_secrets(code)
-        taint = scan_source_sink_heuristic(code) if self.ui.scan_taint_enabled() else []
-        allf = base + sec + taint
+        # Huge minified/vendor bundles: only high-confidence rules (secrets, eval, postMessage)
+        minified = _looks_like_minified_bundle(code)
+        if minified:
+            base = [f for f in analyze_text(code, "js_only")
+                    if f.get("rule_id", "").startswith("JS-SECRET")
+                    or f.get("rule_id") in (
+                        "JS-SECRET-PEM-001", "JS-SECRET-AWS-001",
+                        "JS-SECRET-PROVIDER-001", "JS-SECRET-TOKEN-001",
+                        "JS-EVAL-001", "JS-EVAL-002",
+                        "JS-POSTMSG-001",
+                    )]
+            sec = scan_generic_secrets(code)
+            taint = []
+            allf = base + sec
+        else:
+            base = analyze_text(code, "js_only")
+            sec = scan_generic_secrets(code)
+            taint = scan_source_sink_heuristic(code) if self.ui.scan_taint_enabled() else []
+            allf = base + sec + taint
 
-        # NEW: context-aware gating for noisy JS rules
         try:
             ca = ContextualAnalyzer(code, "js")
             allf = ca.run(allf)
         except Exception as ex:
             self._stderr.println("[JS-Audit] ContextualAnalyzer(js) error: %s" % ex)
 
+        # Score-based verifier
+        verified = []
+        for f in allf:
+            try:
+                keep, vf = verify_finding(f, code, "js")
+                if keep:
+                    verified.append(vf)
+            except Exception:
+                verified.append(f)
+        allf = verified
+
         for f in allf:
             f["title"] = "[%s] %s" % (label, f["title"])
             f["detail"] = "Found in %s. %s" % (label, f["detail"])
         findings.extend(allf)
-        return findings
-
-    def _scan_js_fragment(self, code, label, baseRequestResponse=None, url=None, allowed=None, want_semgrep=False):
-        findings = self._scan_js_fragment_fast(code, label)
-        if want_semgrep and baseRequestResponse is not None and url is not None:
-            self._schedule_semgrep(code, label, baseRequestResponse, url, allowed or set())
         return findings
 
     def _scan_js_fragment(self, code, label, baseRequestResponse=None, url=None, allowed=None, want_semgrep=False):
@@ -2372,24 +3151,34 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
 
             if "html" in kinds and want_html:
                 html_key = self._scan_key(url_str, "html-rules", text, False, "", False)
-                if not self._scan_cache.seen(html_key):
+                # Manual scans always re-run (bypass fragment cache)
+                if manual or not self._scan_cache.seen(html_key):
                     html_findings = analyze_text(text, "html_only")
                     try:
                         ca_html = ContextualAnalyzer(text, "html")
                         html_findings = ca_html.run(html_findings)
                     except Exception as ex:
                         self._stderr.println("[JS-Audit] ContextualAnalyzer(html) error: %s" % ex)
+
+                    verified = []
+                    for f in html_findings:
+                        keep, vf = verify_finding(f, text, "html")
+                        if keep:
+                            verified.append(vf)
+                    html_findings = verified
                     findings.extend(html_findings)
-                    self._scan_cache.mark(html_key)
+                    if not manual:
+                        self._scan_cache.mark(html_key)
 
                 if want_js:
                     scripts = extract_inline_scripts(text)
                     for i, s in enumerate(scripts):
                         code = s["code"]
                         key = self._scan_key(url_str, "inline-script-%d" % (i + 1), code, semgrep_on, packs_csv, taint_on)
-                        if self._scan_cache.seen(key):
+                        if (not manual) and self._scan_cache.seen(key):
                             continue
-                        self._scan_cache.mark(key)
+                        if not manual:
+                            self._scan_cache.mark(key)
                         findings.extend(self._scan_js_fragment(
                             code, "inline script #%d" % (i + 1),
                             baseRequestResponse, url, allowed, want_semgrep))
@@ -2398,9 +3187,10 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
                     for i, h in enumerate(handlers):
                         code = h["code"]
                         key = self._scan_key(url_str, "event-%s-%d" % (h["name"], i + 1), code, semgrep_on, packs_csv, taint_on)
-                        if self._scan_cache.seen(key):
+                        if (not manual) and self._scan_cache.seen(key):
                             continue
-                        self._scan_cache.mark(key)
+                        if not manual:
+                            self._scan_cache.mark(key)
                         findings.extend(self._scan_js_fragment(
                             code, "event %s #%d" % (h["name"], i + 1),
                             baseRequestResponse, url, allowed, want_semgrep))
@@ -2409,40 +3199,42 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
                     for i, j in enumerate(jsurls):
                         code = j["code"]
                         key = self._scan_key(url_str, "javascript-payload-%d" % (i + 1), code, semgrep_on, packs_csv, taint_on)
-                        if self._scan_cache.seen(key):
+                        if (not manual) and self._scan_cache.seen(key):
                             continue
-                        self._scan_cache.mark(key)
+                        if not manual:
+                            self._scan_cache.mark(key)
                         findings.extend(self._scan_js_fragment(
                             code, "javascript payload #%d" % (i + 1),
                             baseRequestResponse, url, allowed, want_semgrep))
 
             elif "js" in kinds and want_js:
                 js_key = self._scan_key(url_str, "js-response", text, semgrep_on, packs_csv, taint_on)
-                if not self._scan_cache.seen(js_key):
-                    self._scan_cache.mark(js_key)
+                if manual or not self._scan_cache.seen(js_key):
+                    if not manual:
+                        self._scan_cache.mark(js_key)
                     findings.extend(self._scan_js_fragment(
                         text, "js response",
                         baseRequestResponse, url, allowed, want_semgrep))
 
             if manual and not kinds:
                 if want_html:
-                    key = self._scan_key(url_str, "manual-html-rules", text, False, "", False)
-                    if not self._scan_cache.seen(key):
-                        self._scan_cache.mark(key)
-                        html_findings = analyze_text(text, "html_only")
-                        try:
-                            ca_html = ContextualAnalyzer(text, "html")
-                            html_findings = ca_html.run(html_findings)
-                        except Exception as ex:
-                            self._stderr.println("[JS-Audit] ContextualAnalyzer(html) error: %s" % ex)
-                        findings.extend(html_findings)
+                    html_findings = analyze_text(text, "html_only")
+                    try:
+                        ca_html = ContextualAnalyzer(text, "html")
+                        html_findings = ca_html.run(html_findings)
+                    except Exception as ex:
+                        self._stderr.println("[JS-Audit] ContextualAnalyzer(html) error: %s" % ex)
+
+                    verified = []
+                    for f in html_findings:
+                        keep, vf = verify_finding(f, text, "html")
+                        if keep:
+                            verified.append(vf)
+                    findings.extend(verified)
                 if want_js:
-                    key = self._scan_key(url_str, "manual-js", text, semgrep_on, packs_csv, taint_on)
-                    if not self._scan_cache.seen(key):
-                        self._scan_cache.mark(key)
-                        findings.extend(self._scan_js_fragment(
-                            text, "manual unknown",
-                            baseRequestResponse, url, allowed, want_semgrep))
+                    findings.extend(self._scan_js_fragment(
+                        text, "manual unknown",
+                        baseRequestResponse, url, allowed, want_semgrep))
 
             filtered = []
             seen = set()
@@ -2505,7 +3297,44 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
                 self.ui.append_log("Error: %s" % ex)
             return []
 
+    def _passive_pump(self):
+        """Drain passive scan queue without blocking the HTTP listener."""
+        from threading import Thread
+        while True:
+            job = None
+            with self._passive_lock:
+                if self._passive_inflight >= self._passive_max_workers:
+                    return
+                if not self._passive_queue:
+                    return
+                job = self._passive_queue.pop(0)
+                self._passive_inflight += 1
+
+            def _worker(j=job):
+                try:
+                    issues = self.scan_message(j, manual=False)
+                    for issue in issues or []:
+                        try:
+                            self._callbacks.addScanIssue(issue)
+                        except Exception as ex:
+                            self._stderr.println("[JS-Audit] addScanIssue error: %s" % ex)
+                except Exception as ex:
+                    self._stderr.println("[JS-Audit] passive worker error: %s" % ex)
+                finally:
+                    with self._passive_lock:
+                        self._passive_inflight = max(0, self._passive_inflight - 1)
+                    try:
+                        self._passive_pump()
+                    except Exception:
+                        pass
+
+            Thread(target=_worker).start()
+
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        """
+        HTTP listener callback — MUST return quickly.
+        Queue passive analysis on background workers so proxy/Repeater are not delayed.
+        """
         if messageIsRequest or not self.ui.passive_enabled():
             return
         if not self.ui.tool_enabled(toolFlag):
@@ -2516,12 +3345,18 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory, IHtt
             return
 
         self._capture_count += 1
-        issues = self.scan_message(messageInfo, manual=False)
-        for issue in issues or []:
-            try:
-                self._callbacks.addScanIssue(issue)
-            except Exception as ex:
-                self._stderr.println("[JS-Audit] addScanIssue error: %s" % ex)
+        with self._passive_lock:
+            if len(self._passive_queue) >= self._passive_queue_max:
+                # Drop oldest to keep latency bounded under heavy traffic
+                try:
+                    self._passive_queue.pop(0)
+                except Exception:
+                    pass
+            self._passive_queue.append(messageInfo)
+        try:
+            self._passive_pump()
+        except Exception as ex:
+            self._stderr.println("[JS-Audit] passive pump error: %s" % ex)
 
     def doPassiveScan(self, baseRequestResponse):
         return None
